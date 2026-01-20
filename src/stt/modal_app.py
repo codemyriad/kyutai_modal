@@ -15,8 +15,14 @@ import modal
 MODEL_ID = "kyutai/stt-1b-en_fr-trfs"
 MODEL_DIR = Path("/models/stt")
 
-# Minimum audio samples needed for reliable transcription
-# Kyutai needs ~2 seconds minimum for good results
+# Minimum audio length for reliable transcription
+# ================================================
+# The Kyutai model crashes with very short audio (<1 second):
+#   IndexError: index -1 is out of bounds for dimension 0 with size 0
+# This happens in model.generate() -> prepare_inputs_for_generation()
+# when cache_position is empty due to insufficient audio frames.
+#
+# We require 2 seconds minimum for reliable results.
 MIN_SAMPLES = 24000 * 2  # 2 seconds at 24kHz
 MIN_BYTES = MIN_SAMPLES * 2  # PCM16 = 2 bytes per sample
 
@@ -77,11 +83,42 @@ app = modal.App("kyutai-stt", image=image)
 )
 @modal.concurrent(max_inputs=12, target_inputs=10)
 class KyutaiSTTService:
-    """Modal service class for Kyutai STT."""
+    """Modal service class for Kyutai STT.
+
+    Memory Snapshot Strategy
+    ========================
+    Modal's memory snapshots speed up cold starts by serializing container state.
+    However, CUDA state cannot be serialized - snapshots run on CPU-only workers.
+
+    We split initialization into two phases:
+
+    1. snap=True (load_model): Runs ONCE during snapshot creation
+       - Load model weights to CPU
+       - Initialize processor
+       - NO CUDA calls allowed (will fail with "No CUDA GPUs are available")
+       - This state gets serialized to the snapshot
+
+    2. snap=False (warmup_gpu): Runs on EVERY container restore
+       - Move model from CPU to GPU
+       - Warmup CUDA kernels
+       - Initialize any runtime state (locks, etc.)
+
+    Cold start flow:
+      [Snapshot restore] -> [warmup_gpu()] -> [Ready to serve]
+
+    Without snapshots, cold start would be:
+      [Download model] -> [Load to GPU] -> [Warmup] -> [Ready to serve]
+
+    The snapshot saves ~30-60s of model loading time on cold starts.
+    """
 
     @modal.enter(snap=True)
     def load_model(self):
-        """Load model to CPU during snapshot phase (no CUDA)."""
+        """Load model to CPU during snapshot phase.
+
+        WARNING: No CUDA calls here! Snapshots run on CPU-only workers.
+        Calling .to("cuda") here causes: RuntimeError: No CUDA GPUs are available
+        """
         import torch
         from transformers import (
             KyutaiSpeechToTextForConditionalGeneration,
