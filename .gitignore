@@ -53,6 +53,11 @@ credentials.json
 *.pem
 *.key
 
+# Large files
+*.wav
+*.mp3
+*.flac
+
 # OS
 .DS_Store
 Thumbs.db
