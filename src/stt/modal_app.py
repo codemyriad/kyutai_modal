@@ -72,13 +72,15 @@ app = modal.App("kyutai-stt", image=image)
 
 
 @app.cls(
-    gpu="L40S",
+    gpu="A100",  # A100 shows most consistent latency (tested L40S, A100, H100)
     memory=32768,  # 32GB system RAM
     timeout=600,
     # Scale to zero when idle - no always-on containers
+    # Note: scaledown_window may not account for active WebSocket connections
+    # Use longer window for interactive sessions to avoid mid-session cold starts
     min_containers=0,
     buffer_containers=0,
-    scaledown_window=60,  # 1-minute idle timeout
+    scaledown_window=300,  # 5-minute idle timeout
     enable_memory_snapshot=True,
 )
 @modal.concurrent(max_inputs=12, target_inputs=10)
