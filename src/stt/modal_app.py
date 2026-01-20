@@ -15,6 +15,11 @@ import modal
 MODEL_ID = "kyutai/stt-1b-en_fr-trfs"
 MODEL_DIR = Path("/models/stt")
 
+# Minimum audio samples needed for reliable transcription
+# Kyutai needs ~2 seconds minimum for good results
+MIN_SAMPLES = 24000 * 2  # 2 seconds at 24kHz
+MIN_BYTES = MIN_SAMPLES * 2  # PCM16 = 2 bytes per sample
+
 
 def download_model():
     """Download model during image build."""
@@ -69,19 +74,14 @@ app = modal.App("kyutai-stt", image=image)
     buffer_containers=0,
     scaledown_window=60,  # 1-minute idle timeout
     enable_memory_snapshot=True,
-    # Note: GPU snapshots require experimental flag
-    # experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=12, target_inputs=10)
 class KyutaiSTTService:
     """Modal service class for Kyutai STT."""
 
     @modal.enter(snap=True)
-    def initialize(self):
-        """Initialize model once per container lifecycle."""
-        import asyncio
-
-        import numpy as np
+    def load_model(self):
+        """Load model to CPU during snapshot phase (no CUDA)."""
         import torch
         from transformers import (
             KyutaiSpeechToTextForConditionalGeneration,
@@ -89,25 +89,37 @@ class KyutaiSTTService:
         )
 
         self.processor = KyutaiSpeechToTextProcessor.from_pretrained(MODEL_DIR)
+        # Load to CPU first - will move to GPU after snapshot restore
         self.model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
             MODEL_DIR,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map="cpu",
         )
         self.model.eval()
+        print("Model loaded to CPU for snapshot")
 
-        # Warmup CUDA kernels
-        dummy = np.random.randn(24000).astype(np.float32) * 0.1
+    @modal.enter(snap=False)
+    def warmup_gpu(self):
+        """Move model to GPU and warmup after snapshot restore."""
+        import asyncio
+
+        import numpy as np
+        import torch
+
+        # Move model to GPU
+        self.model = self.model.to("cuda")
+
+        # Warmup CUDA kernels with a realistic audio length
+        dummy = np.random.randn(48000).astype(np.float32) * 0.1  # 2 seconds
         with torch.no_grad():
             inputs = self.processor(
                 audio=dummy, sampling_rate=24000, return_tensors="pt"
             )
             input_values = inputs.input_values.to("cuda")
-            _ = self.model.generate(input_values=input_values, max_new_tokens=5)
+            _ = self.model.generate(input_values=input_values, max_new_tokens=100)
 
-        # Initialize batching infrastructure
         self._lock = asyncio.Lock()
-        print("Model initialized and warmed up")
+        print("Model initialized and warmed up on GPU")
 
     def _transcribe_sync(self, audio_arrays: list) -> list[str]:
         """Synchronous batched transcription."""
@@ -121,7 +133,16 @@ class KyutaiSTTService:
                 padding=True,
             )
             input_values = inputs.input_values.to("cuda")
-            output_ids = self.model.generate(input_values=input_values, max_new_tokens=256)
+
+            # Calculate reasonable max_new_tokens based on audio length
+            # Roughly 1 token per 40ms of audio
+            audio_duration_ms = len(audio_arrays[0]) / 24000 * 1000
+            max_tokens = max(10, min(500, int(audio_duration_ms / 40)))
+
+            output_ids = self.model.generate(
+                input_values=input_values,
+                max_new_tokens=max_tokens
+            )
             texts = self.processor.batch_decode(output_ids, skip_special_tokens=True)
         return texts
 
@@ -134,8 +155,6 @@ class KyutaiSTTService:
 
         import numpy as np
 
-        CHUNK_BYTES = 23040  # 480ms at 24kHz PCM16
-
         web_app = FastAPI(title="Kyutai STT Service")
 
         @web_app.get("/health")
@@ -145,6 +164,7 @@ class KyutaiSTTService:
                 "model": MODEL_ID,
                 "gpu": "L40S",
                 "sample_rate": 24000,
+                "min_audio_seconds": MIN_SAMPLES / 24000,
             }
 
         @web_app.websocket("/v1/stream")
@@ -157,7 +177,8 @@ class KyutaiSTTService:
                     data = await ws.receive_bytes()
 
                     if data == b"EOS":
-                        if buffer:
+                        # Process any remaining audio
+                        if len(buffer) >= MIN_BYTES // 2:  # At least 1 second for final
                             audio = (
                                 np.frombuffer(buffer, dtype=np.int16).astype(
                                     np.float32
@@ -181,7 +202,8 @@ class KyutaiSTTService:
 
                     buffer.extend(data)
 
-                    if len(buffer) >= CHUNK_BYTES:
+                    # Only transcribe when we have enough audio (2+ seconds)
+                    if len(buffer) >= MIN_BYTES:
                         audio = (
                             np.frombuffer(buffer, dtype=np.int16).astype(np.float32)
                             / 32768.0
