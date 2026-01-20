@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from stt.audio import float32_to_pcm16
+from stt.constants import MIN_AUDIO_BYTES
 from stt.engine.fake import FakeEngine
 from stt.server import StreamSession, create_app
 
@@ -38,6 +39,22 @@ class TestStreamSession:
 
         session.append(bytes(50))
         assert session.has_enough_data()
+
+    def test_has_minimum_audio(self):
+        """has_minimum_audio should respect minimum threshold."""
+        session = StreamSession("test-id")
+
+        # Very short audio (100 bytes = 50 samples = ~2ms)
+        session.append(bytes(100))
+        assert not session.has_minimum_audio()
+
+        # Still not enough (less than 1 second)
+        session.append(bytes(10000))
+        assert not session.has_minimum_audio()
+
+        # Add enough to reach minimum (1 second = 48000 bytes)
+        session.append(bytes(MIN_AUDIO_BYTES))
+        assert session.has_minimum_audio()
 
     def test_flush_clears_buffer(self):
         """Flush should return data and clear buffer."""
@@ -156,11 +173,11 @@ class TestWebSocketEndpoint:
 
     @pytest.mark.asyncio
     async def test_websocket_eos_with_remaining_buffer(self, app):
-        """EOS should process remaining buffer."""
+        """EOS should process remaining buffer if it meets minimum length."""
         with TestClient(app) as tc:
             with tc.websocket_connect("/v1/stream") as ws:
-                # Send small chunk (less than threshold)
-                audio = np.zeros(1000, dtype=np.float32)
+                # Send 2 seconds of audio (meets minimum)
+                audio = np.zeros(48000, dtype=np.float32)
                 pcm = float32_to_pcm16(audio)
                 ws.send_bytes(pcm)
                 ws.send_bytes(b"EOS")
@@ -173,8 +190,36 @@ class TestWebSocketEndpoint:
                         break
 
                 # Should have processed the remaining buffer
-                text_msgs = [m for m in messages if "text" in m and m.get("final")]
-                assert len(text_msgs) >= 0  # May or may not have text depending on threshold
+                assert any(m.get("status") == "complete" for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_websocket_short_audio_no_crash(self, app):
+        """Very short audio should not crash, just skip transcription.
+
+        This test verifies the fix for the IndexError bug that occurred
+        when audio was too short (<1 second) causing model.generate() to fail
+        with 'index -1 is out of bounds for dimension 0 with size 0'.
+        """
+        with TestClient(app) as tc:
+            with tc.websocket_connect("/v1/stream") as ws:
+                # Send very short audio (only 100ms - way below minimum)
+                audio = np.zeros(2400, dtype=np.float32)  # 100ms at 24kHz
+                pcm = float32_to_pcm16(audio)
+                ws.send_bytes(pcm)
+                ws.send_bytes(b"EOS")
+
+                messages = []
+                while True:
+                    msg = ws.receive_json()
+                    messages.append(msg)
+                    if msg.get("status") == "complete":
+                        break
+
+                # Should complete without crash, no transcription for short audio
+                assert any(m.get("status") == "complete" for m in messages)
+                # Should NOT have any text messages (audio too short)
+                text_msgs = [m for m in messages if "text" in m]
+                assert len(text_msgs) == 0
 
 
 class TestServerWithBatching:

@@ -13,7 +13,7 @@ from stt.audio import (
     samples_to_bytes,
     validate_audio_format,
 )
-from stt.constants import CHUNK_BYTES, CHUNK_SAMPLES, FRAME_SAMPLES, SAMPLE_RATE
+from stt.constants import CHUNK_BYTES, CHUNK_MS, CHUNK_SAMPLES, FRAME_SAMPLES, SAMPLE_RATE
 
 
 class TestPCM16Conversion:
@@ -118,12 +118,12 @@ class TestHelperFunctions:
         """Duration in ms to sample count."""
         assert duration_samples(1000) == SAMPLE_RATE  # 1 second
         assert duration_samples(80) == FRAME_SAMPLES  # 80ms
-        assert duration_samples(480) == CHUNK_SAMPLES  # 480ms
+        assert duration_samples(CHUNK_MS) == CHUNK_SAMPLES
 
     def test_duration_bytes(self):
         """Duration in ms to byte count."""
         assert duration_bytes(1000) == SAMPLE_RATE * 2  # 1 second
-        assert duration_bytes(480) == CHUNK_BYTES  # 480ms
+        assert duration_bytes(CHUNK_MS) == CHUNK_BYTES
 
 
 class TestConstants:
@@ -134,9 +134,9 @@ class TestConstants:
         assert FRAME_SAMPLES == 24000 * 80 // 1000
 
     def test_chunk_samples(self):
-        """480ms at 24kHz = 11520 samples."""
-        assert CHUNK_SAMPLES == 24000 * 480 // 1000
+        """CHUNK_MS at 24kHz = CHUNK_SAMPLES."""
+        assert CHUNK_SAMPLES == 24000 * CHUNK_MS // 1000
 
     def test_chunk_bytes(self):
-        """11520 samples * 2 bytes = 23040 bytes."""
+        """CHUNK_SAMPLES * 2 bytes = CHUNK_BYTES."""
         assert CHUNK_BYTES == CHUNK_SAMPLES * 2

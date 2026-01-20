@@ -12,7 +12,7 @@ import numpy as np
 
 from stt.audio import pcm16_to_float32, validate_audio_format
 from stt.batching import BatchingTranscriber
-from stt.constants import CHUNK_BYTES, CHUNK_SAMPLES, MODEL_ID, SAMPLE_RATE
+from stt.constants import CHUNK_BYTES, CHUNK_SAMPLES, MIN_AUDIO_BYTES, MODEL_ID, SAMPLE_RATE
 from stt.engine.protocol import Engine
 
 
@@ -53,6 +53,14 @@ class StreamSession:
     def has_enough_data(self) -> bool:
         """Check if buffer has enough data for transcription."""
         return len(self._buffer) >= self.chunk_threshold
+
+    def has_minimum_audio(self, min_bytes: int = MIN_AUDIO_BYTES) -> bool:
+        """Check if buffer has minimum audio length for reliable transcription.
+
+        The Kyutai model produces errors with very short audio (<1 second).
+        This check prevents IndexError in model.generate() with short input.
+        """
+        return len(self._buffer) >= min_bytes
 
 
 def create_app(engine: Engine, use_batching: bool = True) -> FastAPI:
@@ -109,7 +117,8 @@ def create_app(engine: Engine, use_batching: bool = True) -> FastAPI:
 
                 # Handle end-of-stream signal
                 if data == b"EOS":
-                    if session.buffer_bytes > 0:
+                    # Only transcribe if we have minimum audio (prevents model errors)
+                    if session.has_minimum_audio():
                         text = await _transcribe(session, batcher, engine)
                         if text and text.strip():
                             await websocket.send_json({"text": text, "final": True})

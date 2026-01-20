@@ -12,10 +12,16 @@ BYTES_PER_SAMPLE: int = 2  # 16-bit PCM
 FRAME_MS: int = 80
 FRAME_SAMPLES: int = 1920  # 24000 * 0.080
 
-# Recommended streaming chunk: 480ms (6 frames)
-CHUNK_MS: int = 480
-CHUNK_SAMPLES: int = 11520  # 24000 * 0.480
-CHUNK_BYTES: int = 23040  # 11520 * 2 bytes
+# Recommended streaming chunk: 2000ms (25 frames)
+# Kyutai needs ~2 seconds minimum for reliable transcription
+CHUNK_MS: int = 2000
+CHUNK_SAMPLES: int = 48000  # 24000 * 2.0
+CHUNK_BYTES: int = 96000  # 48000 * 2 bytes
+
+# Minimum audio for transcription (prevents model errors with very short input)
+MIN_AUDIO_MS: int = 1000  # 1 second minimum
+MIN_AUDIO_SAMPLES: int = 24000  # 24000 * 1.0
+MIN_AUDIO_BYTES: int = 48000  # 24000 * 2 bytes
 
 # Model identification
 MODEL_ID: str = "kyutai/stt-1b-en_fr-trfs"
