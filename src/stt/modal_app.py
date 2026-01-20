@@ -2,6 +2,10 @@
 
 Deploy with: uvx modal deploy src/stt/modal_app.py
 Dev server: uvx modal serve src/stt/modal_app.py
+
+Authentication:
+  The endpoint requires proxy auth tokens. Create tokens in Modal workspace settings.
+  Clients must pass Modal-Key and Modal-Secret headers (or query params for WebSocket).
 """
 
 from pathlib import Path
@@ -121,7 +125,7 @@ class KyutaiSTTService:
             texts = self.processor.batch_decode(output_ids, skip_special_tokens=True)
         return texts
 
-    @modal.asgi_app()
+    @modal.asgi_app(requires_proxy_auth=True)
     def serve(self):
         """Create and return the ASGI app."""
         import asyncio

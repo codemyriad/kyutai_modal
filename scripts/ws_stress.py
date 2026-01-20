@@ -6,6 +6,11 @@ Sends multiple audio streams in parallel and validates transcription quality.
 Usage:
     uv run scripts/ws_stress.py --uri wss://your-app.modal.run/v1/stream --concurrency 10
 
+    # With Modal proxy auth (set env vars or use flags):
+    export MODAL_KEY=wk-xxx
+    export MODAL_SECRET=ws-xxx
+    uv run scripts/ws_stress.py --uri wss://your-app.modal.run/v1/stream
+
 Dependencies:
     uv pip install websockets soundfile numpy
 """
@@ -13,6 +18,7 @@ Dependencies:
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -83,6 +89,7 @@ async def run_one(
     chunk_ms: int,
     wer_max: float,
     realtime: bool = False,
+    auth_headers: dict | None = None,
 ) -> tuple[str, bool, float, str, str]:
     """Run a single WebSocket stream and return results."""
     wav_path = Path(sample["wav24k_path"])
@@ -90,7 +97,7 @@ async def run_one(
 
     hyp_parts = []
 
-    async with websockets.connect(uri, max_size=2**24) as ws:
+    async with websockets.connect(uri, max_size=2**24, extra_headers=auth_headers) as ws:
 
         async def sender():
             for chunk in wav24k_to_pcm16_chunks(wav_path, chunk_ms):
@@ -153,7 +160,26 @@ async def main() -> None:
         action="store_true",
         help="Send audio at real-time pace (for latency testing)",
     )
+    ap.add_argument(
+        "--modal-key",
+        default=os.environ.get("MODAL_KEY"),
+        help="Modal proxy auth key (or set MODAL_KEY env var)",
+    )
+    ap.add_argument(
+        "--modal-secret",
+        default=os.environ.get("MODAL_SECRET"),
+        help="Modal proxy auth secret (or set MODAL_SECRET env var)",
+    )
     args = ap.parse_args()
+
+    # Build auth headers if credentials provided
+    auth_headers = None
+    if args.modal_key and args.modal_secret:
+        auth_headers = {
+            "Modal-Key": args.modal_key,
+            "Modal-Secret": args.modal_secret,
+        }
+        print("Using Modal proxy authentication")
 
     manifest_path = Path(args.manifest)
     if not manifest_path.exists():
@@ -181,7 +207,7 @@ async def main() -> None:
     print()
 
     results = await asyncio.gather(
-        *(run_one(args.uri, s, args.chunk_ms, args.wer_max, args.realtime) for s in jobs)
+        *(run_one(args.uri, s, args.chunk_ms, args.wer_max, args.realtime, auth_headers) for s in jobs)
     )
 
     # Print results
