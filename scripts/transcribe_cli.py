@@ -679,6 +679,10 @@ class TranscriptionClient:
                     if self.debug:
                         print("[recv] vad_end - sentence boundary")
 
+                # Handle server keepalive pings (just ignore)
+                elif msg_type == "ping":
+                    pass
+
                 # Legacy format support (text responses)
                 elif "text" in data:
                     text = data.get("text", "")

@@ -21,9 +21,11 @@ import modal
 # Model choice: 1B model for low latency (0.5s first-token vs 2.5s for 2.6B)
 MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
 KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
+APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")  # Allows deploying multiple GPU variants
 MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
 IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "30.0"))
 MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
+PING_INTERVAL_SECONDS = float(os.getenv("PING_INTERVAL_SECONDS", "10.0"))  # Detect dead connections
 
 # Build image with moshi stack
 image = (
@@ -51,7 +53,7 @@ hf_cache_vol = modal.Volume.from_name("kyutai-stt-hf-cache", create_if_missing=T
 hf_cache_vol_path = Path("/root/.cache/huggingface")
 volumes = {hf_cache_vol_path: hf_cache_vol}
 
-app = modal.App("kyutai-stt", image=image)
+app = modal.App(APP_NAME, image=image)
 
 MINUTES = 60
 
@@ -245,6 +247,7 @@ class KyutaiSTTService:
             - Server sends: JSON messages with transcription updates
               - {"type": "token", "text": "word"} - New token
               - {"type": "vad_end"} - Voice activity ended
+              - {"type": "ping"} - Keepalive (client should ignore)
               - {"type": "error", "message": "..."} - Error occurred
             """
             await ws.accept()
@@ -257,16 +260,31 @@ class KyutaiSTTService:
             capture_bytes = bytearray()
             processed_samples = 0
             recv_debug_logged = 0
+            connection_dead = asyncio.Event()
 
             async def send_json(payload: dict) -> bool:
                 try:
                     await asyncio.wait_for(ws.send_text(json.dumps(payload)), timeout=5.0)
                     return True
                 except Exception:
+                    connection_dead.set()
                     return False
 
+            async def ping_task():
+                """Send periodic pings to detect dead connections."""
+                while not connection_dead.is_set():
+                    await asyncio.sleep(PING_INTERVAL_SECONDS)
+                    if connection_dead.is_set():
+                        break
+                    ok = await send_json({"type": "ping"})
+                    if not ok:
+                        print("[ws] ping failed - connection dead")
+                        break
+
+            ping_handle = asyncio.create_task(ping_task())
+
             try:
-                while True:
+                while not connection_dead.is_set():
                     # Enforce max session duration
                     if time.monotonic() - session_start > MAX_SESSION_SECONDS:
                         print(f"[ws] max session duration reached ({MAX_SESSION_SECONDS}s)")
@@ -347,6 +365,14 @@ class KyutaiSTTService:
                 print(f"[ws] session error: {e}")
                 traceback.print_exc()
             finally:
+                # Stop ping task
+                connection_dead.set()
+                ping_handle.cancel()
+                try:
+                    await ping_handle
+                except asyncio.CancelledError:
+                    pass
+
                 print(
                     f"[session] bytes_in={bytes_in} tokens={tokens_sent}"
                 )
