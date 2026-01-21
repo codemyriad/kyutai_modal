@@ -766,10 +766,6 @@ async def main():
         quit_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await quit_task
-        # Restore terminal if rich left it in alt screen
-        if RICH_AVAILABLE and console:
-            with contextlib.suppress(Exception):
-                console.print("\033[?1049l")  # exit alt screen
 
 
 if __name__ == "__main__":
