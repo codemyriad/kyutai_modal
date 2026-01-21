@@ -17,7 +17,7 @@ Server: {"type": "token", "text": " Hello"}
 - **Real-time**: Token-by-token transcription over WebSocket
 - **Scalable**: Auto-scales from 0 to handle concurrent sessions
 - **Cost-effective**: Pay only for GPU time used (scales to zero when idle)
-- **Simple protocol**: Send Opus audio, receive JSON tokens
+- **Simple protocol**: Send raw PCM float32 audio, receive JSON tokens
 
 ## Prerequisites
 
@@ -72,7 +72,7 @@ Speak into your microphone and see real-time transcription.
 Connect to `wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream`
 
 **Protocol:**
-- **Client sends**: Opus-encoded audio bytes (24kHz mono)
+- **Client sends**: Raw PCM float32 (little-endian) audio bytes (24kHz mono). Send in ~80ms chunks for low latency.
 - **Server sends**: JSON messages
 
 ```json
@@ -101,8 +101,10 @@ async def transcribe():
     }
 
     async with websockets.connect(uri, additional_headers=headers) as ws:
-        # Send Opus-encoded audio bytes
-        await ws.send(opus_audio_bytes)
+        # Send raw PCM float32 (LE) audio bytes sampled at 24kHz mono
+        # Example: audio, _ = soundfile.read("audio.wav", dtype="float32")
+        #          pcm_audio_bytes = audio.astype("float32").tobytes()
+        await ws.send(pcm_audio_bytes)
 
         # Receive tokens
         async for message in ws:
@@ -186,9 +188,9 @@ uvx modal app stop kyutai-stt-a100
 
 ## How It Works
 
-1. **Audio Encoding**: Client captures microphone audio at 24kHz and encodes to Opus
-2. **WebSocket Streaming**: Opus packets are streamed to the server over WebSocket
-3. **Neural Codec**: Server decodes Opus and encodes audio with Mimi neural codec (80ms frames)
+1. **Audio Capture**: Client captures microphone audio at 24kHz mono and streams raw PCM float32
+2. **WebSocket Streaming**: PCM chunks (~80ms) are streamed to the server over WebSocket
+3. **Neural Codec**: Server encodes audio with Mimi neural codec (80ms frames)
 4. **Language Model**: Each frame is processed by the streaming transformer for immediate token output
 5. **Token Streaming**: Tokens are sent back immediately as they're generated (~0.5s latency)
 
@@ -213,7 +215,7 @@ Typical costs:
 
 **Connection timeout**: The service may have scaled to zero. First request takes 20-30s for cold start.
 
-**No transcription**: Ensure you're sending Opus-encoded 24kHz mono audio, not raw PCM.
+**No transcription**: Ensure you're sending raw PCM float32 24kHz mono audio (little-endian).
 
 **High latency**: Check your GPU selection. T4 is cheapest but slower than A10G/A100.
 

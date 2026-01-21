@@ -7,7 +7,6 @@ import os
 import time
 
 import numpy as np
-import sphn
 import websockets
 
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
@@ -26,28 +25,8 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
     audio_seconds = len(audio) / 24000
     print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
 
-    # Encode to Opus in streaming chunks
-    encoder = sphn.OpusStreamWriter(24000)
-    frame_size = 960  # 40ms at 24kHz (valid Opus frame size)
-    opus_chunks = []
-
-    for i in range(0, len(audio), frame_size):
-        frame = audio[i:i + frame_size]
-        if len(frame) < frame_size:
-            frame = np.pad(frame, (0, frame_size - len(frame)))
-        # append_pcm expects a 1D array
-        encoder.append_pcm(frame)
-        chunk = encoder.read_bytes()
-        if chunk:
-            opus_chunks.append(chunk)
-
-    # Final read to get any remaining data
-    final_chunk = encoder.read_bytes()
-    if final_chunk:
-        opus_chunks.append(final_chunk)
-
-    opus_bytes = b"".join(opus_chunks)
-    print(f"Opus encoded: {len(opus_bytes)} bytes")
+    pcm_bytes = np.asarray(audio, dtype=np.float32).tobytes()
+    print(f"PCM payload: {len(pcm_bytes)} bytes")
 
     print(f"Connecting to {uri}...")
     connect_start = time.perf_counter()
@@ -61,11 +40,11 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
         connect_time = time.perf_counter() - connect_start
         print(f"Connected in {connect_time:.2f}s")
 
-        # Send all audio at once (Opus packets must be complete)
+        # Send all audio at once (raw PCM float32 LE, 24kHz mono)
         send_start = time.perf_counter()
-        await ws.send(opus_bytes)
+        await ws.send(pcm_bytes)
         send_time = time.perf_counter() - send_start
-        print(f"Sent {len(opus_bytes)} bytes in {send_time:.3f}s")
+        print(f"Sent {len(pcm_bytes)} bytes in {send_time:.3f}s")
 
         # Receive tokens
         recv_start = time.perf_counter()

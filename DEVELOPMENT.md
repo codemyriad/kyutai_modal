@@ -131,8 +131,8 @@ uv run pytest tests/integration_gpu/ -v -m gpu
 ```
 Client                          Server (Modal)
   │                                  │
-  │  ──Opus audio bytes──────────►   │
-  │                                  │  sphn.read_opus_bytes()
+  │  ──Raw PCM float32 bytes─────►   │
+  │                                  │  numpy.frombuffer(...)
   │                                  │  ↓
   │                                  │  mimi.encode() (80ms frames)
   │                                  │  ↓
@@ -169,12 +169,12 @@ tokens = self.lm_gen.step(codes)        # LM inference
 
 This gives ~0.5s first-token latency vs ~5s for batch processing.
 
-#### Opus Audio
+#### Audio Format
 
-The server expects Opus-encoded audio (not raw PCM):
-- Client encodes with `sphn.OpusStreamWriter`
-- Server decodes with `sphn.read_opus_bytes()`
-- 24kHz mono audio
+The server expects raw PCM float32 (little-endian) audio:
+- 24kHz mono
+- Send ~80ms chunks for low latency
+- The server converts byte buffers directly with `numpy.frombuffer`
 
 ### Container Lifecycle
 
@@ -336,9 +336,11 @@ If containers stay alive longer than expected:
 
 The moshi streaming state doesn't survive memory snapshots, so `enable_memory_snapshot=False` is required. Cold starts take ~20-30s as a result.
 
-### Opus Decoding Errors
+### Audio Payload Issues
 
-The server needs complete Ogg pages to decode. The CLI buffers ~4KB before sending to ensure decodability.
+The server expects raw PCM float32 (little-endian) audio at 24kHz mono. If transcripts are empty:
+- Confirm you're sending float32 samples (not int16) at 24kHz
+- Send in ~80ms chunks to avoid idle timeouts
 
 ## Contributing
 

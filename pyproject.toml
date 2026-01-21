@@ -16,7 +16,6 @@ classifiers = [
 ]
 dependencies = [
     "moshi==0.2.9",
-    "sphn",
     "torch==2.4.0",
     "numpy<2",
     "huggingface-hub[hf_transfer]>=0.25.0",

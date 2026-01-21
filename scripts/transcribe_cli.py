@@ -71,7 +71,7 @@ STALL_TIMEOUT_SECONDS = 15.0
 STALL_AUDIO_GRACE = 5.0
 
 # Buffer settings for text correction
-FINALIZE_DELAY_MS = 1500  # Time before text is considered final
+FINALIZE_DELAY_MS = 1800  # Time before text is considered final (slightly longer for accuracy)
 
 
 # ------------------------------------------------------------------------------
@@ -95,74 +95,6 @@ def compute_stall_notice(
     if (now - last_token_ts) <= stall_seconds:
         return None
     return f"No transcripts for {now - last_token_ts:0.1f}s (audio active)"
-
-
-# ------------------------------------------------------------------------------
-# Opus Encoder
-# ------------------------------------------------------------------------------
-
-
-class OpusEncoder:
-    """Encode float32 audio to Opus format for the Kyutai streaming endpoint.
-
-    Buffers audio and produces Ogg/Opus data in chunks large enough to be decoded.
-    The server expects complete Ogg pages, so we buffer ~1 second of audio before
-    sending to ensure decodability.
-    """
-
-    def __init__(self, sample_rate: int = SAMPLE_RATE):
-        import sphn
-
-        self.sample_rate = sample_rate
-        self._pcm_buffer = np.array([], dtype=np.float32)
-        self._opus_buffer = bytearray()
-        # Opus frame size: 40ms at 24kHz = 960 samples (valid Opus frame size)
-        self._frame_size = int(sample_rate * 0.04)  # 40ms
-        # Buffer at least 1 second of encoded audio before sending
-        # This ensures complete Ogg pages for the decoder
-        self._min_send_bytes = 4000  # ~1 second of Opus
-        self._encoder = sphn.OpusStreamWriter(sample_rate)
-        # Verify the encoder has the expected methods
-        if not hasattr(self._encoder, 'read_bytes'):
-            raise RuntimeError(f"sphn.OpusStreamWriter missing read_bytes method. Type: {type(self._encoder)}, Methods: {dir(self._encoder)}")
-
-    def encode(self, pcm_data: np.ndarray) -> bytes:
-        """Encode PCM float32 audio to Opus bytes."""
-        self._pcm_buffer = np.concatenate([self._pcm_buffer, pcm_data.astype(np.float32)])
-
-        # Encode complete frames
-        while len(self._pcm_buffer) >= self._frame_size:
-            frame = self._pcm_buffer[: self._frame_size]
-            self._pcm_buffer = self._pcm_buffer[self._frame_size :]
-            self._encoder.append_pcm(frame)
-            opus_bytes = self._encoder.read_bytes()
-            if opus_bytes:
-                self._opus_buffer.extend(opus_bytes)
-
-        # Only return data if we have enough for a complete Ogg page
-        if len(self._opus_buffer) >= self._min_send_bytes:
-            result = bytes(self._opus_buffer)
-            self._opus_buffer.clear()
-            return result
-        return b""
-
-    def flush(self) -> bytes:
-        """Flush any remaining audio and finalize the Opus stream."""
-        if len(self._pcm_buffer) > 0:
-            # Pad to frame size
-            pad_len = self._frame_size - len(self._pcm_buffer)
-            if pad_len > 0:
-                self._pcm_buffer = np.concatenate([self._pcm_buffer, np.zeros(pad_len, dtype=np.float32)])
-            self._encoder.append_pcm(self._pcm_buffer)
-            self._pcm_buffer = np.array([], dtype=np.float32)
-
-        final_bytes = self._encoder.read_bytes()
-        if final_bytes:
-            self._opus_buffer.extend(final_bytes)
-
-        result = bytes(self._opus_buffer)
-        self._opus_buffer.clear()
-        return result
 
 
 # ------------------------------------------------------------------------------
@@ -458,9 +390,9 @@ class TranscriptionClient:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.transcript = TranscriptManager()
         self.display = RichDisplay() if RICH_AVAILABLE else SimpleDisplay()
-        self.encoder = OpusEncoder()
 
         self.audio_queue = asyncio.Queue()
+        self.stop_event: asyncio.Event | None = None
         self.running = False
         self.connected = False
         self.level_dbfs = float("-inf")
@@ -483,6 +415,8 @@ class TranscriptionClient:
             print(reason)
         self.running = False
         self.connected = False
+        if self.stop_event is not None:
+            self.stop_event.set()
         try:
             self.audio_queue.put_nowait(None)
         except Exception:
@@ -612,12 +546,7 @@ class TranscriptionClient:
                     break
                 if text.strip().lower() == "q":
                     print("\nQuit requested (q)")
-                    self.running = False
-                    self.reconnect_requested = False
-                    try:
-                        await self.audio_queue.put(None)
-                    except Exception:
-                        pass
+                    self.request_stop()
                     break
         finally:
             if restore_termios is not None and fd is not None:
@@ -637,13 +566,14 @@ class TranscriptionClient:
                 if audio_data is None:
                     break
                 if self.ws and self.connected:
-                    encoded = self.encoder.encode(audio_data)
-                    if encoded:
-                        await self.ws.send(encoded)
-                        self.audio_sent_bytes += len(encoded)
-                        chunks_sent += 1
-                        if chunks_sent <= 3 and self.debug:
-                            print(f"[send] chunk {chunks_sent}: {len(encoded)} bytes")
+                    pcm_bytes = np.asarray(audio_data, dtype=np.float32).tobytes()
+                    if not pcm_bytes:
+                        continue
+                    await self.ws.send(pcm_bytes)
+                    self.audio_sent_bytes += len(pcm_bytes)
+                    chunks_sent += 1
+                    if chunks_sent <= 3 and self.debug:
+                        print(f"[send] chunk {chunks_sent}: {len(pcm_bytes)} bytes")
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -863,12 +793,31 @@ class TranscriptionClient:
         """Main run loop."""
         self.running = True
         self.loop = asyncio.get_running_loop()
+        self.stop_event = asyncio.Event()
         if self.start_time is None:
             self.start_time = time.time()
 
         while self.running:
             self.reconnect_requested = False
-            if not await self.connect():
+            connect_task = asyncio.create_task(self.connect(), name="connect")
+            stop_task = asyncio.create_task(self.stop_event.wait(), name="stop_wait")
+
+            done, _ = await asyncio.wait(
+                {connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if stop_task in done:
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                break
+
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+
+            try:
+                if not await connect_task:
+                    break
+            except asyncio.CancelledError:
                 break
 
             tasks = [

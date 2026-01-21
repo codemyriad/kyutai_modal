@@ -36,7 +36,6 @@ image = (
     .apt_install("ffmpeg")
     .pip_install(
         "moshi==0.2.9",
-        "sphn",
         "torch==2.4.0",
         "numpy<2",
         "fastapi>=0.115.0",
@@ -228,7 +227,6 @@ class KyutaiSTTService:
         import traceback
 
         import numpy as np
-        import sphn
         from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
         web_app = FastAPI(title="Kyutai STT Streaming API")
@@ -261,7 +259,7 @@ class KyutaiSTTService:
             """WebSocket endpoint for streaming audio transcription.
 
             Protocol:
-            - Client sends: Opus-encoded audio bytes
+            - Client sends: Raw PCM float32 LE audio bytes (24kHz mono)
             - Server sends: JSON messages with transcription updates
               - {"type": "token", "text": "word"} - New token
               - {"type": "vad_end"} - Voice activity ended
@@ -276,7 +274,6 @@ class KyutaiSTTService:
             tokens_sent = 0
             all_pcm_data = None
             capture_bytes = bytearray()
-            processed_samples = 0
             recv_debug_logged = 0
             connection_dead = asyncio.Event()
 
@@ -327,34 +324,23 @@ class KyutaiSTTService:
                         continue
 
                     bytes_in += len(data)
-                    if len(capture_bytes) < 1_500_000:
-                        capture_bytes.extend(data)
+                    capture_bytes.extend(data)
                     if recv_debug_logged < 3:
                         recv_debug_logged += 1
                         print(f"[ws] received chunk len={len(data)} total={bytes_in}")
 
-                    # Decode all received Opus bytes and process new PCM samples
-                    try:
-                        pcm_out, sr_out = sphn.read_opus_bytes(bytes(capture_bytes))
-                    except Exception as exc:
-                        print(f"[ws] opus decode error: {exc}")
+                    # Convert any complete float32 samples to PCM
+                    usable_len = len(capture_bytes) // 4 * 4  # 4 bytes per float32 sample
+                    if usable_len == 0:
                         continue
 
-                    if pcm_out.ndim > 1:
-                        pcm_out = pcm_out[0]
+                    pcm_out = np.frombuffer(memoryview(capture_bytes)[:usable_len], dtype=np.float32).copy()
+                    del capture_bytes[:usable_len]
 
-                    # Resample if needed
-                    target_sr = self.mimi.sample_rate
-                    if sr_out != target_sr:
-                        x_old = np.linspace(0, 1, pcm_out.shape[-1])
-                        x_new = np.linspace(0, 1, int(pcm_out.shape[-1] * target_sr / sr_out))
-                        pcm_out = np.interp(x_new, x_old, pcm_out).astype(np.float32)
-
-                    if processed_samples >= pcm_out.shape[-1]:
+                    if pcm_out.size == 0:
                         continue
 
-                    new_pcm = pcm_out[processed_samples:]
-                    processed_samples = pcm_out.shape[-1]
+                    new_pcm = pcm_out
 
                     # Process audio and yield tokens
                     try:

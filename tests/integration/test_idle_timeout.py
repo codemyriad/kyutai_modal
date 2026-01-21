@@ -40,35 +40,15 @@ def get_auth_headers() -> dict | None:
     return None
 
 
-def create_opus_audio(duration_seconds: float = 1.0) -> bytes:
-    """Create Opus-encoded audio for testing."""
-    import sphn
-
+def create_pcm_audio(duration_seconds: float = 1.0) -> bytes:
+    """Create raw PCM float32 audio for testing."""
     sample_rate = 24000
     num_samples = int(sample_rate * duration_seconds)
 
     # Generate silence (or could add a tone for more realistic test)
     audio = np.zeros(num_samples, dtype=np.float32)
 
-    # Encode to Opus
-    encoder = sphn.OpusStreamWriter(sample_rate)
-    frame_size = 960  # 40ms at 24kHz
-
-    for i in range(0, len(audio), frame_size):
-        frame = audio[i:i + frame_size]
-        if len(frame) < frame_size:
-            frame = np.pad(frame, (0, frame_size - len(frame)))
-        encoder.append_pcm(frame)
-
-    # Get all encoded bytes
-    opus_bytes = bytearray()
-    while True:
-        chunk = encoder.read_bytes()
-        if not chunk:
-            break
-        opus_bytes.extend(chunk)
-
-    return bytes(opus_bytes)
+    return audio.tobytes()
 
 
 @pytest.fixture
@@ -93,7 +73,7 @@ class TestIdleTimeout:
         stop sending audio.
         """
         # Create some initial audio to establish the connection
-        audio = create_opus_audio(duration_seconds=2.0)
+        audio = create_pcm_audio(duration_seconds=2.0)
 
         async with websockets.connect(
             ws_url,
@@ -165,7 +145,7 @@ class TestIdleTimeout:
     @pytest.mark.timeout(120)
     async def test_continuous_audio_keeps_connection_alive(self, ws_url, auth_headers):
         """Connection should stay open while audio is being sent."""
-        audio_chunk = create_opus_audio(duration_seconds=1.0)
+        audio_chunk = create_pcm_audio(duration_seconds=1.0)
 
         async with websockets.connect(
             ws_url,
@@ -202,7 +182,7 @@ class TestIdleTimeout:
     @pytest.mark.timeout(30)
     async def test_ping_messages_received(self, ws_url, auth_headers):
         """Server should send periodic ping messages."""
-        audio = create_opus_audio(duration_seconds=2.0)
+        audio = create_pcm_audio(duration_seconds=2.0)
 
         async with websockets.connect(
             ws_url,
@@ -241,7 +221,7 @@ class TestConnectionRecovery:
     @pytest.mark.timeout(30)
     async def test_reconnect_after_idle_close(self, ws_url, auth_headers):
         """Should be able to reconnect after server closes idle connection."""
-        audio = create_opus_audio(duration_seconds=1.0)
+        audio = create_pcm_audio(duration_seconds=1.0)
 
         # First connection - let it idle and close
         async with websockets.connect(
