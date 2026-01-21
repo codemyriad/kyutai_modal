@@ -1,272 +1,352 @@
-"""Modal deployment configuration for Kyutai STT service.
+"""Modal deployment for Kyutai STT with low-latency streaming.
 
 Deploy with: uvx modal deploy src/stt/modal_app.py
 Dev server: uvx modal serve src/stt/modal_app.py
+
+This implementation uses moshi's streaming architecture for ~0.5s first-token latency
+instead of the batch-based transformers approach (~5s latency).
 
 Authentication:
   The endpoint requires proxy auth tokens. Create tokens in Modal workspace settings.
   Clients must pass Modal-Key and Modal-Secret headers (or query params for WebSocket).
 """
 
+import asyncio
+import os
+import time
 from pathlib import Path
 
 import modal
 
-MODEL_ID = "kyutai/stt-1b-en_fr-trfs"
-MODEL_DIR = Path("/models/stt")
+# Model choice: 1B model for low latency (0.5s first-token vs 2.5s for 2.6B)
+MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
+KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
+MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
+IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "30.0"))
 
-# Minimum audio length for reliable transcription
-# ================================================
-# The Kyutai model crashes with very short audio (<1 second):
-#   IndexError: index -1 is out of bounds for dimension 0 with size 0
-# This happens in model.generate() -> prepare_inputs_for_generation()
-# when cache_position is empty due to insufficient audio frames.
-#
-# We require 2 seconds minimum for reliable results.
-MIN_SAMPLES = 24000 * 2  # 2 seconds at 24kHz
-MIN_BYTES = MIN_SAMPLES * 2  # PCM16 = 2 bytes per sample
-
-
-def download_model():
-    """Download model during image build."""
-    import os
-
-    from huggingface_hub import snapshot_download
-
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-
-    snapshot_download(
-        repo_id=MODEL_ID,
-        local_dir=MODEL_DIR,
-        ignore_patterns=["*.md", "*.txt"],
-    )
-
-
-# Build image with model weights baked in
+# Build image with moshi stack
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    .apt_install("ffmpeg")
     .pip_install(
+        "moshi==0.2.9",
+        "sphn",
         "torch==2.4.0",
-        "transformers>=4.53.0",
-        "accelerate>=0.33.0",
-        "huggingface-hub[hf_transfer]>=0.25.0",
-        "torchaudio>=2.4.0",
+        "numpy<2",
         "fastapi>=0.115.0",
         "websockets>=13.0",
-        "numpy<2",
+        "huggingface-hub[hf_transfer]>=0.25.0",
     )
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            # Disable torch.compile to avoid CUDA graph issues in thread pools
-            "TORCH_COMPILE_DISABLE": "1",
-            "TORCHDYNAMO_DISABLE": "1",
         }
     )
-    .run_function(download_model)
 )
+
+# Volume for caching model weights
+hf_cache_vol = modal.Volume.from_name("kyutai-stt-hf-cache", create_if_missing=True)
+hf_cache_vol_path = Path("/root/.cache/huggingface")
+volumes = {hf_cache_vol_path: hf_cache_vol}
 
 app = modal.App("kyutai-stt", image=image)
 
+MINUTES = 60
+
 
 @app.cls(
-    gpu="A100",  # A100 shows most consistent latency (tested L40S, A100, H100)
-    memory=32768,  # 32GB system RAM
-    timeout=600,
-    # Scale to zero when idle - no always-on containers
-    # Note: scaledown_window may not account for active WebSocket connections
-    # Use longer window for interactive sessions to avoid mid-session cold starts
+    gpu=KYUTAI_GPU,
+    volumes=volumes,
+    timeout=30 * MINUTES,
+    scaledown_window=2 * MINUTES,
+    max_containers=2,
     min_containers=0,
-    buffer_containers=0,
-    scaledown_window=300,  # 5-minute idle timeout
-    enable_memory_snapshot=True,
+    enable_memory_snapshot=False,  # Disabled: moshi streaming state doesn't survive snapshots
 )
-@modal.concurrent(max_inputs=12, target_inputs=10)
+@modal.concurrent(max_inputs=MAX_CONCURRENT_SESSIONS)
 class KyutaiSTTService:
-    """Modal service class for Kyutai STT.
+    """Real-time streaming Speech-to-Text service using Kyutai STT with moshi."""
 
-    Memory Snapshot Strategy
-    ========================
-    Modal's memory snapshots speed up cold starts by serializing container state.
-    However, CUDA state cannot be serialized - snapshots run on CPU-only workers.
+    BATCH_SIZE = 1
 
-    We split initialization into two phases:
-
-    1. snap=True (load_model): Runs ONCE during snapshot creation
-       - Load model weights to CPU
-       - Initialize processor
-       - NO CUDA calls allowed (will fail with "No CUDA GPUs are available")
-       - This state gets serialized to the snapshot
-
-    2. snap=False (warmup_gpu): Runs on EVERY container restore
-       - Move model from CPU to GPU
-       - Warmup CUDA kernels
-       - Initialize any runtime state (locks, etc.)
-
-    Cold start flow:
-      [Snapshot restore] -> [warmup_gpu()] -> [Ready to serve]
-
-    Without snapshots, cold start would be:
-      [Download model] -> [Load to GPU] -> [Warmup] -> [Ready to serve]
-
-    The snapshot saves ~30-60s of model loading time on cold starts.
-    """
-
-    @modal.enter(snap=True)
+    @modal.enter()
     def load_model(self):
-        """Load model to CPU during snapshot phase.
-
-        WARNING: No CUDA calls here! Snapshots run on CPU-only workers.
-        Calling .to("cuda") here causes: RuntimeError: No CUDA GPUs are available
-        """
+        """Load model and warmup GPU on container startup."""
         import torch
-        from transformers import (
-            KyutaiSpeechToTextForConditionalGeneration,
-            KyutaiSpeechToTextProcessor,
+        from huggingface_hub import snapshot_download
+        from moshi.models import LMGen, loaders
+
+        print(f"Loading Kyutai STT model: {MODEL_NAME}")
+        start_time = time.monotonic_ns()
+
+        # Download model weights (cached in volume)
+        snapshot_download(MODEL_NAME)
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
+
+        # Load model components directly to GPU
+        checkpoint_info = loaders.CheckpointInfo.from_hf_repo(MODEL_NAME)
+        self.mimi = checkpoint_info.get_mimi(device=self.device)
+        self.moshi = checkpoint_info.get_moshi(device=self.device)
+        self.text_tokenizer = checkpoint_info.get_text_tokenizer()
+
+        # Create language model generator
+        self.lm_gen = LMGen(self.moshi, temp=0, temp_text=0)
+
+        # Model configuration
+        self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        print(
+            f"Mimi: sample_rate={self.mimi.sample_rate} "
+            f"frame_rate={self.mimi.frame_rate} frame_size={self.frame_size}"
         )
 
-        self.processor = KyutaiSpeechToTextProcessor.from_pretrained(MODEL_DIR)
-        # Load to CPU first - will move to GPU after snapshot restore
-        self.model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
-            MODEL_DIR,
-            torch_dtype=torch.bfloat16,
-            device_map="cpu",
-        )
-        self.model.eval()
-        print("Model loaded to CPU for snapshot")
+        # Enable streaming mode
+        self.mimi.streaming_forever(self.BATCH_SIZE)
+        self.lm_gen.streaming_forever(self.BATCH_SIZE)
 
-    @modal.enter(snap=False)
-    def warmup_gpu(self):
-        """Move model to GPU and warmup after snapshot restore."""
-        import asyncio
+        # Warmup CUDA kernels
+        print("Warming up GPU...")
+        for _ in range(4):
+            codes = self.mimi.encode(
+                torch.zeros(self.BATCH_SIZE, 1, self.frame_size).to(self.device)
+            )
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c : c + 1])
+                if tokens is None:
+                    continue
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
+        # Initialize session semaphore
+        self.session_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+
+        elapsed = round((time.monotonic_ns() - start_time) / 1e9, 2)
+        print(f"Model loaded and warmed up in {elapsed}s")
+
+    def reset_state(self):
+        """Reset model state between sessions."""
+        self.mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
+
+    async def transcribe_chunk(self, pcm, all_pcm_data):
+        """Process an audio chunk and yield transcription tokens.
+
+        Args:
+            pcm: New PCM audio data (numpy array, float32)
+            all_pcm_data: Accumulated PCM data from previous chunks
+
+        Yields:
+            - str: A transcription token (word fragment)
+            - dict: Control messages (e.g., {"type": "vad_end"})
+            - numpy.ndarray: Remaining PCM data (yielded last)
+        """
         import numpy as np
         import torch
 
-        # Move model to GPU
-        self.model = self.model.to("cuda")
+        if pcm is None or len(pcm) == 0:
+            yield all_pcm_data
+            return
 
-        # Warmup CUDA kernels with a realistic audio length
-        dummy = np.random.randn(48000).astype(np.float32) * 0.1  # 2 seconds
-        with torch.no_grad():
-            inputs = self.processor(
-                audio=dummy, sampling_rate=24000, return_tensors="pt"
-            )
-            input_values = inputs.input_values.to("cuda")
-            _ = self.model.generate(input_values=input_values, max_new_tokens=100)
+        if pcm.shape[-1] == 0:
+            yield all_pcm_data
+            return
 
-        self._lock = asyncio.Lock()
-        print("Model initialized and warmed up on GPU")
+        if all_pcm_data is None:
+            all_pcm_data = pcm
+        else:
+            all_pcm_data = np.concatenate((all_pcm_data, pcm))
 
-    def _transcribe_sync(self, audio_arrays: list) -> list[str]:
-        """Synchronous batched transcription."""
-        import torch
+        # Process each complete frame (80ms at 24kHz = 1920 samples)
+        while all_pcm_data.shape[-1] >= self.frame_size:
+            chunk = all_pcm_data[: self.frame_size]
+            all_pcm_data = all_pcm_data[self.frame_size :]
 
-        with torch.no_grad():
-            inputs = self.processor(
-                audio=audio_arrays,
-                sampling_rate=24000,
-                return_tensors="pt",
-                padding=True,
-            )
-            input_values = inputs.input_values.to("cuda")
+            with torch.no_grad():
+                chunk = torch.from_numpy(chunk)
+                chunk = chunk.unsqueeze(0).unsqueeze(0)  # (1, 1, frame_size)
+                chunk = chunk.expand(self.BATCH_SIZE, -1, -1)
+                chunk = chunk.to(device=self.device)
 
-            # Calculate reasonable max_new_tokens based on audio length
-            # Roughly 1 token per 40ms of audio
-            audio_duration_ms = len(audio_arrays[0]) / 24000 * 1000
-            max_tokens = max(10, min(500, int(audio_duration_ms / 40)))
+                # Encode audio with mimi
+                codes = self.mimi.encode(chunk)
 
-            output_ids = self.model.generate(
-                input_values=input_values,
-                max_new_tokens=max_tokens
-            )
-            texts = self.processor.batch_decode(output_ids, skip_special_tokens=True)
-        return texts
+                # Run language model inference
+                for c in range(codes.shape[-1]):
+                    text_tokens, vad_heads = self.lm_gen.step_with_extra_heads(
+                        codes[:, :, c : c + 1]
+                    )
+                    if text_tokens is None:
+                        yield all_pcm_data
+                        return
+
+                    # Check voice activity detection
+                    if vad_heads:
+                        pr_vad = vad_heads[2][0, 0, 0].cpu().item()
+                        if pr_vad > 0.5:
+                            # End of speech detected
+                            yield {"type": "vad_end"}
+                            yield all_pcm_data
+                            return
+
+                    text_token = text_tokens[0, 0, 0].item()
+                    # Token 0 and 3 are special tokens (padding/silence)
+                    if text_token not in (0, 3):
+                        text = self.text_tokenizer.id_to_piece(text_token)
+                        text = text.replace("\u2581", " ")  # Sentencepiece space marker
+                        yield text
+
+        yield all_pcm_data
 
     @modal.asgi_app(requires_proxy_auth=True)
     def serve(self):
         """Create and return the ASGI app."""
-        import asyncio
-
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        import json
+        import traceback
 
         import numpy as np
+        import sphn
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-        web_app = FastAPI(title="Kyutai STT Service")
+        web_app = FastAPI(title="Kyutai STT Streaming API")
 
         @web_app.get("/health")
         def health():
             return {
                 "status": "ok",
-                "model": MODEL_ID,
-                "gpu": "L40S",
-                "sample_rate": 24000,
-                "min_audio_seconds": MIN_SAMPLES / 24000,
+                "model": MODEL_NAME,
+                "gpu": KYUTAI_GPU,
+                "sample_rate": int(self.mimi.sample_rate),
+                "frame_rate": int(self.mimi.frame_rate),
+                "frame_size": self.frame_size,
+            }
+
+        @web_app.get("/")
+        async def root():
+            return {
+                "service": "Kyutai STT (Streaming)",
+                "model": MODEL_NAME,
+                "status": "ready",
+                "endpoints": {
+                    "websocket": "/v1/stream",
+                    "health": "/health",
+                },
             }
 
         @web_app.websocket("/v1/stream")
-        async def stream_transcribe(ws: WebSocket):
+        async def transcribe_websocket(ws: WebSocket):
+            """WebSocket endpoint for streaming audio transcription.
+
+            Protocol:
+            - Client sends: Opus-encoded audio bytes
+            - Server sends: JSON messages with transcription updates
+              - {"type": "token", "text": "word"} - New token
+              - {"type": "vad_end"} - Voice activity ended
+              - {"type": "error", "message": "..."} - Error occurred
+            """
             await ws.accept()
-            buffer = bytearray()
+            print("Session started")
+
+            bytes_in = 0
+            tokens_sent = 0
+            all_pcm_data = None
+            capture_bytes = bytearray()
+            processed_samples = 0
+            recv_debug_logged = 0
+
+            async def send_json(payload: dict) -> bool:
+                try:
+                    await asyncio.wait_for(ws.send_text(json.dumps(payload)), timeout=5.0)
+                    return True
+                except Exception:
+                    return False
 
             try:
                 while True:
-                    data = await ws.receive_bytes()
-
-                    if data == b"EOS":
-                        # Process any remaining audio
-                        if len(buffer) >= MIN_BYTES // 2:  # At least 1 second for final
-                            audio = (
-                                np.frombuffer(buffer, dtype=np.int16).astype(
-                                    np.float32
-                                )
-                                / 32768.0
-                            )
-                            loop = asyncio.get_event_loop()
-                            try:
-                                texts = await loop.run_in_executor(
-                                    None, self._transcribe_sync, [audio]
-                                )
-                                if texts and texts[0].strip():
-                                    await ws.send_json({"text": texts[0], "final": True})
-                            except Exception as e:
-                                print(f"Transcription error (final): {e}")
-                                import traceback
-                                traceback.print_exc()
-                                await ws.send_json({"error": str(e)})
-                        await ws.send_json({"status": "complete"})
+                    try:
+                        data = await asyncio.wait_for(
+                            ws.receive_bytes(), timeout=IDLE_AUDIO_TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        print("[ws] receive timeout")
+                        break
+                    except WebSocketDisconnect:
+                        print("[ws] client disconnect")
+                        break
+                    except Exception as e:
+                        print(f"[ws] receive error: {e}")
+                        traceback.print_exc()
                         break
 
-                    buffer.extend(data)
+                    if not data:
+                        continue
 
-                    # Only transcribe when we have enough audio (2+ seconds)
-                    if len(buffer) >= MIN_BYTES:
-                        audio = (
-                            np.frombuffer(buffer, dtype=np.int16).astype(np.float32)
-                            / 32768.0
-                        )
-                        buffer.clear()
+                    bytes_in += len(data)
+                    if len(capture_bytes) < 1_500_000:
+                        capture_bytes.extend(data)
+                    if recv_debug_logged < 3:
+                        recv_debug_logged += 1
+                        print(f"[ws] received chunk len={len(data)} total={bytes_in}")
 
-                        loop = asyncio.get_event_loop()
-                        try:
-                            texts = await loop.run_in_executor(
-                                None, self._transcribe_sync, [audio]
-                            )
-                            if texts and texts[0].strip():
-                                await ws.send_json({"text": texts[0], "final": False})
-                        except Exception as e:
-                            print(f"Transcription error: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            await ws.send_json({"error": str(e)})
+                    # Decode all received Opus bytes and process new PCM samples
+                    try:
+                        pcm_out, sr_out = sphn.read_opus_bytes(bytes(capture_bytes))
+                    except Exception as exc:
+                        print(f"[ws] opus decode error: {exc}")
+                        continue
 
-            except WebSocketDisconnect:
-                pass
+                    if pcm_out.ndim > 1:
+                        pcm_out = pcm_out[0]
+
+                    # Resample if needed
+                    target_sr = self.mimi.sample_rate
+                    if sr_out != target_sr:
+                        x_old = np.linspace(0, 1, pcm_out.shape[-1])
+                        x_new = np.linspace(0, 1, int(pcm_out.shape[-1] * target_sr / sr_out))
+                        pcm_out = np.interp(x_new, x_old, pcm_out).astype(np.float32)
+
+                    if processed_samples >= pcm_out.shape[-1]:
+                        continue
+
+                    new_pcm = pcm_out[processed_samples:]
+                    processed_samples = pcm_out.shape[-1]
+
+                    # Process audio and yield tokens
+                    try:
+                        async for msg in self.transcribe_chunk(new_pcm, all_pcm_data):
+                            if isinstance(msg, str):
+                                ok = await send_json({"type": "token", "text": msg})
+                                if not ok:
+                                    print(f"[ws] send failed for token: {msg}")
+                                    raise RuntimeError("send failed")
+                                tokens_sent += 1
+                                if tokens_sent <= 5:
+                                    print(f"[ws] sent token {tokens_sent}: {msg}")
+                            elif isinstance(msg, dict):
+                                ok = await send_json(msg)
+                                if not ok:
+                                    print(f"[ws] send failed for msg: {msg}")
+                                    raise RuntimeError("send failed")
+                            else:
+                                all_pcm_data = msg
+                    except Exception as e:
+                        print(f"[ws] inference/send error: {e}")
+                        traceback.print_exc()
+                        continue
+
             except Exception as e:
-                print(f"WebSocket error: {e}")
-                import traceback
+                print(f"[ws] session error: {e}")
                 traceback.print_exc()
+            finally:
+                print(
+                    f"[session] bytes_in={bytes_in} tokens={tokens_sent}"
+                )
+                self.reset_state()
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                print("Session ended")
 
         return web_app

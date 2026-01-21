@@ -1,13 +1,4 @@
-#!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "numpy",
-#   "rich",
-#   "sounddevice",
-#   "websockets",
-# ]
-# ///
+#!/usr/bin/env -S uv run python
 """
 Real-time Microphone Transcription CLI
 
@@ -106,40 +97,71 @@ def compute_stall_notice(
 
 
 # ------------------------------------------------------------------------------
-# PCM16 Encoder
+# Opus Encoder
 # ------------------------------------------------------------------------------
 
 
-class PCM16Encoder:
-    """Convert float32 audio to PCM16 bytes for the Kyutai endpoint."""
+class OpusEncoder:
+    """Encode float32 audio to Opus format for the Kyutai streaming endpoint.
+
+    Buffers audio and produces Ogg/Opus data in chunks large enough to be decoded.
+    The server expects complete Ogg pages, so we buffer ~1 second of audio before
+    sending to ensure decodability.
+    """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
+        import sphn
+
         self.sample_rate = sample_rate
-        self._buffer = np.array([], dtype=np.float32)
-        # Send in chunks of 1920 samples (80ms at 24kHz)
-        self._frame_size = 1920
+        self._pcm_buffer = np.array([], dtype=np.float32)
+        self._opus_buffer = bytearray()
+        # Opus frame size: 40ms at 24kHz = 960 samples (valid Opus frame size)
+        self._frame_size = int(sample_rate * 0.04)  # 40ms
+        # Buffer at least 1 second of encoded audio before sending
+        # This ensures complete Ogg pages for the decoder
+        self._min_send_bytes = 4000  # ~1 second of Opus
+        self._encoder = sphn.OpusStreamWriter(sample_rate)
+        # Verify the encoder has the expected methods
+        if not hasattr(self._encoder, 'read_bytes'):
+            raise RuntimeError(f"sphn.OpusStreamWriter missing read_bytes method. Type: {type(self._encoder)}, Methods: {dir(self._encoder)}")
 
     def encode(self, pcm_data: np.ndarray) -> bytes:
-        """Encode PCM float32 audio to PCM16 bytes."""
-        self._buffer = np.concatenate([self._buffer, pcm_data.astype(np.float32)])
+        """Encode PCM float32 audio to Opus bytes."""
+        self._pcm_buffer = np.concatenate([self._pcm_buffer, pcm_data.astype(np.float32)])
 
-        encoded_chunks = []
-        while len(self._buffer) >= self._frame_size:
-            frame = self._buffer[: self._frame_size]
-            self._buffer = self._buffer[self._frame_size :]
-            # Convert float32 [-1, 1] to int16
-            pcm16 = (np.clip(frame, -1.0, 1.0) * 32767.0).astype(np.int16)
-            encoded_chunks.append(pcm16.tobytes())
+        # Encode complete frames
+        while len(self._pcm_buffer) >= self._frame_size:
+            frame = self._pcm_buffer[: self._frame_size]
+            self._pcm_buffer = self._pcm_buffer[self._frame_size :]
+            self._encoder.append_pcm(frame)
+            opus_bytes = self._encoder.read_bytes()
+            if opus_bytes:
+                self._opus_buffer.extend(opus_bytes)
 
-        return b"".join(encoded_chunks)
+        # Only return data if we have enough for a complete Ogg page
+        if len(self._opus_buffer) >= self._min_send_bytes:
+            result = bytes(self._opus_buffer)
+            self._opus_buffer.clear()
+            return result
+        return b""
 
     def flush(self) -> bytes:
-        """Flush any remaining audio in the buffer."""
-        if len(self._buffer) == 0:
-            return b""
-        pcm16 = (np.clip(self._buffer, -1.0, 1.0) * 32767.0).astype(np.int16)
-        self._buffer = np.array([], dtype=np.float32)
-        return pcm16.tobytes()
+        """Flush any remaining audio and finalize the Opus stream."""
+        if len(self._pcm_buffer) > 0:
+            # Pad to frame size
+            pad_len = self._frame_size - len(self._pcm_buffer)
+            if pad_len > 0:
+                self._pcm_buffer = np.concatenate([self._pcm_buffer, np.zeros(pad_len, dtype=np.float32)])
+            self._encoder.append_pcm(self._pcm_buffer)
+            self._pcm_buffer = np.array([], dtype=np.float32)
+
+        final_bytes = self._encoder.read_bytes()
+        if final_bytes:
+            self._opus_buffer.extend(final_bytes)
+
+        result = bytes(self._opus_buffer)
+        self._opus_buffer.clear()
+        return result
 
 
 # ------------------------------------------------------------------------------
@@ -435,7 +457,7 @@ class TranscriptionClient:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.transcript = TranscriptManager()
         self.display = RichDisplay() if RICH_AVAILABLE else SimpleDisplay()
-        self.encoder = PCM16Encoder()
+        self.encoder = OpusEncoder()
 
         self.audio_queue = asyncio.Queue()
         self.running = False
@@ -605,6 +627,7 @@ class TranscriptionClient:
 
     async def _send_loop(self):
         """Send queued audio to the server."""
+        chunks_sent = 0
         while self.running and self.connected:
             try:
                 audio_data = await asyncio.wait_for(
@@ -617,6 +640,9 @@ class TranscriptionClient:
                     if encoded:
                         await self.ws.send(encoded)
                         self.audio_sent_bytes += len(encoded)
+                        chunks_sent += 1
+                        if chunks_sent <= 3 and self.debug:
+                            print(f"[send] chunk {chunks_sent}: {len(encoded)} bytes")
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -636,27 +662,40 @@ class TranscriptionClient:
                 if self.debug:
                     print(f"[recv] {data}")
 
-                # Handle text responses from our Kyutai endpoint
-                if "text" in data:
+                msg_type = data.get("type")
+
+                # Handle token-by-token streaming
+                if msg_type == "token":
                     text = data.get("text", "")
-                    if text.strip():
-                        # Add text as a token (with space separator)
-                        self.transcript.add_token(text + " ")
+                    if text:
+                        self.transcript.add_token(text)
                         self.tokens_received += 1
                         self.last_token_ts = time.time()
 
-                    # If this is a final segment, add newline
+                # Handle voice activity end (sentence boundary)
+                elif msg_type == "vad_end":
+                    self.transcript.force_finalize()
+                    self.transcript.add_token("\n")
+                    if self.debug:
+                        print("[recv] vad_end - sentence boundary")
+
+                # Legacy format support (text responses)
+                elif "text" in data:
+                    text = data.get("text", "")
+                    if text.strip():
+                        self.transcript.add_token(text + " ")
+                        self.tokens_received += 1
+                        self.last_token_ts = time.time()
                     if data.get("final"):
                         self.transcript.force_finalize()
                         self.transcript.add_token("\n")
 
                 elif data.get("status") == "complete":
-                    # Stream complete
                     if self.debug:
                         print("[recv] stream complete")
 
-                elif "error" in data:
-                    print(f"\nServer error: {data.get('error')}")
+                elif msg_type == "error" or "error" in data:
+                    print(f"\nServer error: {data.get('message') or data.get('error')}")
 
             except asyncio.TimeoutError:
                 continue
@@ -767,7 +806,7 @@ class TranscriptionClient:
                 )
                 status = (
                     f"Time {elapsed:.1f}s | Sent {self.audio_sent_bytes / 1024:.1f}KB | "
-                    f"Segments {self.tokens_received} (last: {since_token})"
+                    f"Tokens {self.tokens_received} (last: {since_token})"
                 )
                 if not self.connected:
                     status += " | Disconnected"
@@ -860,11 +899,6 @@ class TranscriptionClient:
                 except Exception:
                     pass
                 if self.ws:
-                    # Send EOS before closing
-                    try:
-                        await self.ws.send(b"EOS")
-                    except Exception:
-                        pass
                     try:
                         await self.ws.close()
                     except Exception:

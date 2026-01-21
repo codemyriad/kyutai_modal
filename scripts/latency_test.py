@@ -7,6 +7,7 @@ import os
 import time
 
 import numpy as np
+import sphn
 import websockets
 
 
@@ -18,10 +19,33 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
     audio, sr = sf.read(wav_path, dtype="float32")
     if sr != 24000:
         raise ValueError(f"Expected 24kHz, got {sr}")
-    pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes()
-    audio_seconds = len(audio) / 24000
 
-    print(f"Audio: {audio_seconds:.1f}s ({len(pcm)} bytes)")
+    audio_seconds = len(audio) / 24000
+    print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
+
+    # Encode to Opus in streaming chunks
+    encoder = sphn.OpusStreamWriter(24000)
+    frame_size = 960  # 40ms at 24kHz (valid Opus frame size)
+    opus_chunks = []
+
+    for i in range(0, len(audio), frame_size):
+        frame = audio[i:i + frame_size]
+        if len(frame) < frame_size:
+            frame = np.pad(frame, (0, frame_size - len(frame)))
+        # append_pcm expects a 1D array
+        encoder.append_pcm(frame)
+        chunk = encoder.read_bytes()
+        if chunk:
+            opus_chunks.append(chunk)
+
+    # Final read to get any remaining data
+    final_chunk = encoder.read_bytes()
+    if final_chunk:
+        opus_chunks.append(final_chunk)
+
+    opus_bytes = b"".join(opus_chunks)
+    print(f"Opus encoded: {len(opus_bytes)} bytes")
+
     print(f"Connecting to {uri}...")
     connect_start = time.perf_counter()
 
@@ -34,36 +58,57 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
         connect_time = time.perf_counter() - connect_start
         print(f"Connected in {connect_time:.2f}s")
 
-        # Send audio
+        # Send all audio at once (Opus packets must be complete)
         send_start = time.perf_counter()
-        await ws.send(pcm)
-        await ws.send(b"EOS")
+        await ws.send(opus_bytes)
         send_time = time.perf_counter() - send_start
-        print(f"Sent {len(pcm)} bytes in {send_time:.3f}s")
+        print(f"Sent {len(opus_bytes)} bytes in {send_time:.3f}s")
 
-        # Wait for response
+        # Receive tokens
         recv_start = time.perf_counter()
-        first_response = None
-        while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=60)
-            data = json.loads(msg)
-            if first_response is None and "text" in data:
-                first_response = time.perf_counter() - recv_start
-                print(f"First transcription in {first_response:.3f}s: {data.get('text', '')[:50]}")
-            if data.get("status") == "complete":
-                break
+        first_token_time = None
+        all_tokens = []
+
+        try:
+            while True:
+                msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                data = json.loads(msg)
+
+                if data.get("type") == "token":
+                    text = data.get("text", "")
+                    all_tokens.append(text)
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter() - recv_start
+                        print(f"First token in {first_token_time:.3f}s: '{text}'")
+                elif data.get("type") == "vad_end":
+                    print(f"VAD end detected")
+                elif "text" in data:  # Legacy format
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter() - recv_start
+                        print(f"First response in {first_token_time:.3f}s: {data.get('text', '')[:50]}")
+                elif data.get("status") == "complete":
+                    break
+        except asyncio.TimeoutError:
+            print("Receive timeout (expected for streaming)")
+        except websockets.exceptions.ConnectionClosed:
+            print("Connection closed (session ended)")
 
         total_time = time.perf_counter() - send_start
+        full_text = "".join(all_tokens)
+
+        print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
         print(f"  Connect: {connect_time:.2f}s")
         print(f"  Send: {send_time:.3f}s")
-        print(f"  First response: {first_response:.3f}s" if first_response else "  No transcription returned")
+        print(f"  First token: {first_token_time:.3f}s" if first_token_time else "  No tokens received")
+        print(f"  Total tokens: {len(all_tokens)}")
 
         return {
             "connect_time": connect_time,
             "send_time": send_time,
-            "first_response": first_response,
+            "first_token_time": first_token_time,
             "total_time": total_time,
+            "token_count": len(all_tokens),
         }
 
 
