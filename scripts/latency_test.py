@@ -10,6 +10,9 @@ import numpy as np
 import sphn
 import websockets
 
+# Modal workspace name (set via MODAL_WORKSPACE env var or change default)
+MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
+
 
 async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav", auth_headers: dict | None = None):
     """Send audio and measure time to first response."""
@@ -161,7 +164,7 @@ async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_head
 def get_app_url(app_name: str) -> str:
     """Get WebSocket URL for a Modal app."""
     # Modal URL pattern: wss://{workspace}--{app-name}-{class}-{method}.modal.run
-    return f"wss://silviot--{app_name}-kyutaisttservice-serve.modal.run/v1/stream"
+    return f"wss://{MODAL_WORKSPACE}--{app_name}-kyutaisttservice-serve.modal.run/v1/stream"
 
 
 async def deploy_gpu_variant(gpu: str, auth_headers: dict | None) -> str | None:
@@ -279,7 +282,7 @@ async def main():
                         help="Skip warmup request")
     args = parser.parse_args()
 
-    uri = "wss://silviot--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+    uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
 
     # Auth from environment
     modal_key = os.environ.get("MODAL_KEY")

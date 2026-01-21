@@ -21,7 +21,8 @@ import pytest
 import websockets
 
 # Test configuration
-DEFAULT_WS_URL = "wss://silviot--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
+DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
 IDLE_TIMEOUT_SECONDS = 10  # Expected server idle timeout (should match IDLE_AUDIO_TIMEOUT_SECONDS)
 
 

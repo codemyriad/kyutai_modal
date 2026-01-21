@@ -1,8 +1,19 @@
 [project]
 name = "kyutai-stt-modal"
 version = "0.1.0"
-description = "Production-ready speech-to-text service using kyutai/stt-1b-en_fr on Modal"
+description = "Real-time streaming speech-to-text on Modal with ~0.5s latency"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+keywords = ["speech-to-text", "stt", "transcription", "streaming", "modal", "kyutai", "moshi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
     "moshi==0.2.9",
     "sphn",
