@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-timeout>=2.3.0",
     "httpx>=0.27.0",
     "modal>=0.64.0",
 ]
@@ -30,11 +31,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "gpu: marks tests as requiring GPU (deselect with '-m \"not gpu\"')",
+    "integration: marks tests that require deployed Modal service",
 ]
+
+[tool.pytest-asyncio]
+asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/stt"]

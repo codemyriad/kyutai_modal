@@ -23,7 +23,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
 KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
 APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")  # Allows deploying multiple GPU variants
 MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
-IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "30.0"))
+IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "10.0"))  # Close idle connections quickly
 MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
 PING_INTERVAL_SECONDS = float(os.getenv("PING_INTERVAL_SECONDS", "10.0"))  # Detect dead connections
 
