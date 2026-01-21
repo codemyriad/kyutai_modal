@@ -11,6 +11,8 @@ import websockets
 
 try:
     from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
     from rich.progress import (
         BarColumn,
         Progress,
@@ -23,7 +25,7 @@ try:
 
     RICH_AVAILABLE = True
 except Exception:
-    Console = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = None
+    Console = Live = Panel = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = None
     RICH_AVAILABLE = False
 
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
@@ -81,6 +83,49 @@ async def measure_latency(
     print(f"Connecting to {uri}...")
     connect_start = time.perf_counter()
 
+    console = Console() if RICH_AVAILABLE else None
+    live = None
+    state = {}
+    bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
+
+    def render_dashboard():
+        if not RICH_AVAILABLE:
+            return None
+        pct = (
+            state["sent_bytes"] / state["total_bytes"]
+            if state.get("total_bytes")
+            else 0.0
+        )
+        bar_len = 24
+        filled = int(bar_len * pct)
+        bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim] {pct*100:5.1f}%"
+
+        def fmt(v, suffix="s"):
+            return f"{v:.3f}{suffix}" if v is not None else "--"
+
+        table = Table.grid(padding=(0, 1))
+        table.add_column(justify="left", ratio=2, style="white")
+        table.add_column(justify="right", ratio=1, style="cyan")
+
+        table.add_row("Status", state.get("status", "--"))
+        table.add_row("RT factor", f"{state.get('rtf', 1.0)}x")
+        table.add_row("Audio", f"{state.get('audio_len', 0):.1f}s")
+        table.add_row("Connect", fmt(state.get("connect_time")))
+        table.add_row("Send", bar if state.get("total_bytes") else "--")
+        table.add_row("Send time", fmt(state.get("send_time")))
+        table.add_row("Tokens", str(state.get("tokens", 0)))
+        table.add_row("First token", fmt(state.get("first_token")))
+        table.add_row("10th token", fmt(state.get("tenth_token")))
+        table.add_row("Last token", fmt(state.get("last_token")))
+        table.add_row("Total time", fmt(state.get("total_time")))
+
+        bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
+        return Panel(
+            table,
+            title=f"[magenta]{bear} Kyutai STT Latency[/magenta]",
+            border_style="magenta",
+        )
+
     async with websockets.connect(
         uri,
         additional_headers=auth_headers,
@@ -90,34 +135,36 @@ async def measure_latency(
         connect_time = time.perf_counter() - connect_start
         print(f"Connected in {connect_time:.2f}s")
 
+        # Init UI state
+        state = {
+            "status": "connected",
+            "rtf": real_time_factor,
+            "audio_len": audio_seconds,
+            "sent_bytes": 0,
+            "total_bytes": audio.nbytes,
+            "tokens": 0,
+            "connect_time": connect_time,
+            "first_token": None,
+            "tenth_token": None,
+            "last_token": None,
+            "send_time": None,
+            "total_time": None,
+            "bear_idx": 0,
+        }
+
+        if RICH_AVAILABLE:
+            live = Live(render_dashboard(), console=console, refresh_per_second=12, screen=True)
+            live.start()
+
         # Stream audio in chunks to mirror realtime usage
         print(f"Streaming audio at {real_time_factor}x realtime...")
         start_time = time.perf_counter()
 
-        progress = None
-        console = Console() if RICH_AVAILABLE else None
-        token_task_id = None
-        send_task_id = None
-        bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
-
-        if RICH_AVAILABLE:
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                console=console,
-            )
-            progress.start()
-            send_task_id = progress.add_task(
-                f"[cyan]Streaming {real_time_factor}x[/cyan]", total=audio.nbytes
-            )
-            token_task_id = progress.add_task("[magenta]Tokens[/magenta]", total=None)
-
         def progress_update(sent_bytes: int):
-            if progress and send_task_id is not None:
-                progress.update(send_task_id, completed=sent_bytes)
+            state["sent_bytes"] = sent_bytes
+            state["status"] = "streaming"
+            if live:
+                live.update(render_dashboard())
 
         send_task = asyncio.create_task(
             _stream_audio(ws, audio, sr, real_time_factor, progress_update=progress_update)
@@ -148,13 +195,14 @@ async def measure_latency(
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First token in {token_times[0]:.3f}s: '{text}'")
-                    if progress and token_task_id is not None:
-                        frame = bear_frames[len(tokens) % len(bear_frames)]
-                        progress.update(
-                            token_task_id,
-                            advance=1,
-                            description=f"[magenta]{frame} tokens {len(tokens)}[/magenta]",
-                        )
+                        state["first_token"] = token_times[0]
+                    if len(token_times) == 10:
+                        state["tenth_token"] = token_times[9]
+                    state["last_token"] = token_times[-1]
+                    state["tokens"] = len(tokens)
+                    state["bear_idx"] = len(tokens)
+                    if live:
+                        live.update(render_dashboard())
                 elif data.get("type") == "vad_end":
                     print("VAD end detected")
                 elif data.get("type") == "ping":
@@ -164,13 +212,14 @@ async def measure_latency(
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First response in {token_times[0]:.3f}s: {data.get('text', '')[:50]}")
-                    if progress and token_task_id is not None:
-                        frame = bear_frames[len(tokens) % len(bear_frames)]
-                        progress.update(
-                            token_task_id,
-                            advance=1,
-                            description=f"[magenta]{frame} tokens {len(tokens)}[/magenta]",
-                        )
+                        state["first_token"] = token_times[0]
+                    if len(token_times) == 10:
+                        state["tenth_token"] = token_times[9]
+                    state["last_token"] = token_times[-1]
+                    state["tokens"] = len(tokens)
+                    state["bear_idx"] = len(tokens)
+                    if live:
+                        live.update(render_dashboard())
                 elif data.get("status") == "complete":
                     break
         except asyncio.TimeoutError:
@@ -181,9 +230,12 @@ async def measure_latency(
         send_time = await send_task
         total_time = time.perf_counter() - start_time
         full_text = "".join(tokens)
-
-        if progress:
-            progress.stop()
+        state["send_time"] = send_time
+        state["total_time"] = total_time
+        state["status"] = "complete"
+        if live:
+            live.update(render_dashboard())
+            live.stop()
 
         print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
