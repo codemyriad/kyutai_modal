@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import queue
 import json
 import os
 import signal
@@ -45,7 +46,7 @@ async def _stream_audio(
     sample_rate: int,
     real_time_factor: float,
     progress_update=None,
-    playback_stream=None,
+    playback_buffer=None,
 ) -> float:
     """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
     chunk_size = int(sample_rate * CHUNK_DURATION_S)
@@ -58,11 +59,8 @@ async def _stream_audio(
         if chunk.size == 0:
             continue
         await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
-        if playback_stream is not None:
-            try:
-                playback_stream.write(chunk)
-            except Exception:
-                pass
+        if playback_buffer is not None:
+            playback_buffer.write(chunk)
         bytes_sent += chunk.nbytes
         if progress_update:
             progress_update(bytes_sent)
@@ -117,18 +115,57 @@ async def measure_latency(
             word_timeline = None
 
     playback_stream = None
+    playback_buffer = None
     if playback:
         try:
             import sounddevice as sd
 
+            class PlaybackBuffer:
+                def __init__(self):
+                    self._q = queue.Queue()
+                    self._buf = np.array([], dtype=np.float32)
+
+                def write(self, chunk: np.ndarray):
+                    self._q.put(chunk.astype(np.float32))
+
+                def read(self, frames: int) -> np.ndarray:
+                    out = []
+                    needed = frames
+                    while needed > 0:
+                        if self._buf.size == 0:
+                            try:
+                                self._buf = self._q.get_nowait()
+                            except queue.Empty:
+                                out.append(np.zeros(needed, dtype=np.float32))
+                                break
+                        take = min(needed, self._buf.size)
+                        out.append(self._buf[:take])
+                        self._buf = self._buf[take:]
+                        needed -= take
+                    return np.concatenate(out) if out else np.zeros(frames, dtype=np.float32)
+
+            playback_buffer = PlaybackBuffer()
+
+            def callback(outdata, frames, time_info, status):
+                data = playback_buffer.read(frames)
+                if data.size < frames:
+                    data = np.pad(data, (0, frames - data.size))
+                outdata[:, 0] = data
+
             playback_stream = sd.OutputStream(
-                samplerate=sr, channels=1, dtype="float32", device=playback_device
+                samplerate=sr,
+                channels=1,
+                dtype="float32",
+                device=playback_device,
+                callback=callback,
+                blocksize=int(sr * CHUNK_DURATION_S),
             )
             playback_stream.start()
             print(f"Playback enabled (device: {playback_device or 'default'})")
         except Exception as exc:
             print(f"Playback disabled (failed to init): {exc}")
             playback_stream = None
+            playback_buffer = None
 
     audio_seconds = len(audio) / 24000
     print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
@@ -252,7 +289,7 @@ async def measure_latency(
                 sr,
                 real_time_factor,
                 progress_update=progress_update,
-                playback_stream=playback_stream,
+                playback_buffer=playback_buffer,
             )
         )
 
