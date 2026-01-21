@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+from difflib import SequenceMatcher
 
 import numpy as np
 import websockets
@@ -22,10 +23,11 @@ try:
         TimeElapsedColumn,
     )
     from rich.table import Table
+    from rich.text import Text
 
     RICH_AVAILABLE = True
 except Exception:
-    Console = Live = Panel = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = None
+    Console = Live = Panel = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = Text = None
     RICH_AVAILABLE = False
 
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
@@ -65,6 +67,7 @@ async def measure_latency(
     wav_path: str = "samples/wav24k/chunk_0.wav",
     auth_headers: dict | None = None,
     real_time_factor: float = 1.0,
+    expected_text: str | None = None,
 ):
     """Send audio in streaming chunks and measure token latencies."""
     import soundfile as sf
@@ -118,13 +121,21 @@ async def measure_latency(
         table.add_row("10th token", fmt(state.get("tenth_token")))
         table.add_row("Last token", fmt(state.get("last_token")))
         table.add_row("Total time", fmt(state.get("total_time")))
+        if state.get("similarity") is not None:
+            table.add_row("Similarity", f"{state['similarity']*100:5.1f}%")
 
         bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
-        return Panel(
-            table,
-            title=f"[magenta]{bear} Kyutai STT Latency[/magenta]",
-            border_style="magenta",
-        )
+        content = table
+
+        if state.get("expected_text") and Text:
+            exp_text = state.get("expected_render") or Text(state["expected_text"])
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=1)
+            grid.add_column(ratio=2)
+            grid.add_row(table, Panel(exp_text, title="Expected vs recognized", border_style="green"))
+            content = grid
+
+        return Panel(content, title=f"[magenta]{bear} Kyutai STT Latency[/magenta]", border_style="magenta")
 
     async with websockets.connect(
         uri,
@@ -150,6 +161,9 @@ async def measure_latency(
             "send_time": None,
             "total_time": None,
             "bear_idx": 0,
+            "expected_text": expected_text,
+            "expected_render": None,
+            "similarity": None,
         }
 
         if RICH_AVAILABLE:
@@ -174,6 +188,26 @@ async def measure_latency(
         tokens = []
         token_times = []
         last_msg_ts = time.perf_counter()
+        recognized_text = ""
+
+        def update_expected_render():
+            if not expected_text:
+                return
+            matcher = SequenceMatcher(None, expected_text, recognized_text)
+            state["similarity"] = matcher.ratio()
+            if not Text:
+                return
+            text_out = Text()
+            last_idx = 0
+            for i, j, n in matcher.get_matching_blocks():
+                if i > last_idx:
+                    text_out.append(expected_text[last_idx:i], style="dim")
+                if n:
+                    text_out.append(expected_text[i : i + n], style="bold green")
+                last_idx = i + n
+            if last_idx < len(expected_text):
+                text_out.append(expected_text[last_idx:], style="dim")
+            state["expected_render"] = text_out
 
         try:
             while True:
@@ -192,6 +226,7 @@ async def measure_latency(
                 if data.get("type") == "token":
                     text = data.get("text", "")
                     tokens.append(text)
+                    recognized_text = "".join(tokens)
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First token in {token_times[0]:.3f}s: '{text}'")
@@ -201,6 +236,7 @@ async def measure_latency(
                     state["last_token"] = token_times[-1]
                     state["tokens"] = len(tokens)
                     state["bear_idx"] = len(tokens)
+                    update_expected_render()
                     if live:
                         live.update(render_dashboard())
                 elif data.get("type") == "vad_end":
@@ -209,6 +245,7 @@ async def measure_latency(
                     pass  # Server keepalive, ignore
                 elif "text" in data:  # Legacy format
                     tokens.append(data.get("text", ""))
+                    recognized_text = "".join(tokens)
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First response in {token_times[0]:.3f}s: {data.get('text', '')[:50]}")
@@ -218,6 +255,7 @@ async def measure_latency(
                     state["last_token"] = token_times[-1]
                     state["tokens"] = len(tokens)
                     state["bear_idx"] = len(tokens)
+                    update_expected_render()
                     if live:
                         live.update(render_dashboard())
                 elif data.get("status") == "complete":
@@ -237,7 +275,7 @@ async def measure_latency(
             live.update(render_dashboard())
             live.stop()
 
-        print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
+    print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
         print(f"  Connect: {connect_time:.2f}s")
         print(f"  Send: {send_time:.3f}s")
@@ -246,6 +284,8 @@ async def measure_latency(
             print(f"  First token: {token_times[0]:.3f}s")
             print(f"  10th token: {late:.3f}s" if len(token_times) >= 10 else f"  Last token: {token_times[-1]:.3f}s")
             print(f"  Final token: {token_times[-1]:.3f}s")
+            if expected_text and state.get("similarity") is not None:
+                print(f"  Similarity vs expected: {state['similarity']*100:5.1f}%")
         else:
             print("  No tokens received")
         print(f"  Total tokens: {len(tokens)}")
@@ -257,16 +297,17 @@ async def measure_latency(
             "last_token_time": token_times[-1] if token_times else None,
             "total_time": total_time,
             "token_count": len(tokens),
+            "similarity": state.get("similarity"),
         }
 
 
-async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, warmup: bool = True):
+async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, expected_text: str | None, warmup: bool = True):
     """Run multiple streams in parallel to test concurrent handling."""
 
     if warmup:
         print("Warmup request (excludes cold boot from stats)...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
+            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
             print("Warmup complete.\n")
         except Exception as e:
             print(f"Warmup failed: {e}\n")
@@ -274,7 +315,7 @@ async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_head
     print(f"Running {num_streams} parallel streams...")
 
     async def labeled_test(idx: int):
-        result = await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
+        result = await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
         return idx, result
 
     tasks = [labeled_test(i) for i in range(num_streams)]
@@ -341,7 +382,7 @@ async def deploy_gpu_variant(gpu: str, auth_headers: dict | None) -> str | None:
     return get_app_url(app_name)
 
 
-async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float):
+async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, expected_text: str | None):
     """Deploy each GPU to separate apps, then test all in parallel."""
     import subprocess
 
@@ -369,7 +410,7 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     async def warmup_one(gpu: str, uri: str):
         print(f"  Warming up {gpu}...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
+            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
             print(f"  {gpu} warm")
             return True
         except Exception as e:
@@ -387,7 +428,7 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     results = {}
     for gpu, uri in gpu_urls.items():
         print(f"\n--- {gpu} ---")
-        latencies = await run_parallel_test(uri, num_streams, wav_path, auth_headers, real_time_factor, warmup=False)
+        latencies = await run_parallel_test(uri, num_streams, wav_path, auth_headers, real_time_factor, expected_text, warmup=False)
         if latencies:
             results[gpu] = {
                 "avg": sum(latencies) / len(latencies),
@@ -431,9 +472,25 @@ async def main():
                         help="Compare GPUs (comma-separated, e.g., 'T4,L4,A10G,A100')")
     parser.add_argument("--no-warmup", action="store_true",
                         help="Skip warmup request")
+    parser.add_argument("--expected", type=str, default=None,
+                        help="Expected transcript text (for visualization/quality)")
+    parser.add_argument("--expected-file", type=str, default=None,
+                        help="Path to expected transcript text file (falls back to <wav>.txt if present)")
     args = parser.parse_args()
 
     uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+    expected_text = args.expected
+    if expected_text is None:
+        candidate = args.expected_file
+        if candidate is None:
+            default_txt = f"{args.wav}.txt"
+            candidate = default_txt if os.path.exists(default_txt) else None
+        if candidate and os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    expected_text = f.read().strip()
+            except Exception:
+                expected_text = None
 
     # Auth from environment
     modal_key = os.environ.get("MODAL_KEY")
@@ -446,16 +503,16 @@ async def main():
     if args.compare_gpus:
         gpus = [g.strip() for g in args.compare_gpus.split(",")]
         num_streams = args.parallel if args.parallel > 0 else 3
-        await compare_gpus(gpus, num_streams, args.wav, auth_headers, args.rtf)
+        await compare_gpus(gpus, num_streams, args.wav, auth_headers, args.rtf, expected_text)
     elif args.parallel > 0:
-        await run_parallel_test(uri, args.parallel, args.wav, auth_headers, args.rtf, warmup=not args.no_warmup)
+        await run_parallel_test(uri, args.parallel, args.wav, auth_headers, args.rtf, expected_text, warmup=not args.no_warmup)
     else:
         # Sequential mode
         for i in range(args.runs):
             print(f"\n{'='*50}")
             print(f"Test {i+1}/{args.runs}")
             print('='*50)
-            await measure_latency(uri, wav_path=args.wav, auth_headers=auth_headers, real_time_factor=args.rtf)
+            await measure_latency(uri, wav_path=args.wav, auth_headers=auth_headers, real_time_factor=args.rtf, expected_text=expected_text)
 
 
 if __name__ == "__main__":
