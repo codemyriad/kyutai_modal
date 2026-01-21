@@ -9,22 +9,49 @@ import time
 import numpy as np
 import websockets
 
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+
+    RICH_AVAILABLE = True
+except Exception:
+    Console = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = None
+    RICH_AVAILABLE = False
+
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
 CHUNK_DURATION_S = 0.08  # 80ms chunks to mirror realtime streaming
 
 
-async def _stream_audio(ws, audio: np.ndarray, sample_rate: int, real_time_factor: float) -> float:
+async def _stream_audio(
+    ws,
+    audio: np.ndarray,
+    sample_rate: int,
+    real_time_factor: float,
+    progress_update=None,
+) -> float:
     """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
     chunk_size = int(sample_rate * CHUNK_DURATION_S)
     rtf = max(0.25, real_time_factor)  # avoid zero/negative/too-slow
     send_start = time.perf_counter()
+    bytes_sent = 0
 
     for i in range(0, len(audio), chunk_size):
         chunk = audio[i : i + chunk_size]
         if chunk.size == 0:
             continue
         await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+        bytes_sent += chunk.nbytes
+        if progress_update:
+            progress_update(bytes_sent)
         # Sleep to simulate live streaming (faster if rtf > 1.0)
         await asyncio.sleep(len(chunk) / sample_rate / rtf)
 
@@ -66,7 +93,35 @@ async def measure_latency(
         # Stream audio in chunks to mirror realtime usage
         print(f"Streaming audio at {real_time_factor}x realtime...")
         start_time = time.perf_counter()
-        send_task = asyncio.create_task(_stream_audio(ws, audio, sr, real_time_factor))
+
+        progress = None
+        console = Console() if RICH_AVAILABLE else None
+        token_task_id = None
+        send_task_id = None
+        bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
+
+        if RICH_AVAILABLE:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            )
+            progress.start()
+            send_task_id = progress.add_task(
+                f"[cyan]Streaming {real_time_factor}x[/cyan]", total=audio.nbytes
+            )
+            token_task_id = progress.add_task("[magenta]Tokens[/magenta]", total=None)
+
+        def progress_update(sent_bytes: int):
+            if progress and send_task_id is not None:
+                progress.update(send_task_id, completed=sent_bytes)
+
+        send_task = asyncio.create_task(
+            _stream_audio(ws, audio, sr, real_time_factor, progress_update=progress_update)
+        )
 
         # Receive tokens
         tokens = []
@@ -93,6 +148,13 @@ async def measure_latency(
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First token in {token_times[0]:.3f}s: '{text}'")
+                    if progress and token_task_id is not None:
+                        frame = bear_frames[len(tokens) % len(bear_frames)]
+                        progress.update(
+                            token_task_id,
+                            advance=1,
+                            description=f"[magenta]{frame} tokens {len(tokens)}[/magenta]",
+                        )
                 elif data.get("type") == "vad_end":
                     print("VAD end detected")
                 elif data.get("type") == "ping":
@@ -102,6 +164,13 @@ async def measure_latency(
                     token_times.append(last_msg_ts - start_time)
                     if len(token_times) == 1:
                         print(f"First response in {token_times[0]:.3f}s: {data.get('text', '')[:50]}")
+                    if progress and token_task_id is not None:
+                        frame = bear_frames[len(tokens) % len(bear_frames)]
+                        progress.update(
+                            token_task_id,
+                            advance=1,
+                            description=f"[magenta]{frame} tokens {len(tokens)}[/magenta]",
+                        )
                 elif data.get("status") == "complete":
                     break
         except asyncio.TimeoutError:
@@ -112,6 +181,9 @@ async def measure_latency(
         send_time = await send_task
         total_time = time.perf_counter() - start_time
         full_text = "".join(tokens)
+
+        if progress:
+            progress.stop()
 
         print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
