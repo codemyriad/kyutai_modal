@@ -26,6 +26,9 @@ MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
 IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "10.0"))  # Close idle connections quickly
 MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
 PING_INTERVAL_SECONDS = float(os.getenv("PING_INTERVAL_SECONDS", "10.0"))  # Detect dead connections
+# LM generation parameters (temp=0 = greedy decoding, fastest and deterministic)
+LM_TEMP = float(os.getenv("LM_TEMP", "0"))
+LM_TEMP_TEXT = float(os.getenv("LM_TEMP_TEXT", "0"))
 
 # Build image with moshi stack
 image = (
@@ -90,14 +93,39 @@ class KyutaiSTTService:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
 
+        # Enable TF32 for Ampere+ GPUs (A100, A10G, L4, H100)
+        # Ignored on older GPUs (T4) - they'll use FP32 automatically
+        if self.device == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         # Load model components directly to GPU
         checkpoint_info = loaders.CheckpointInfo.from_hf_repo(MODEL_NAME)
         self.mimi = checkpoint_info.get_mimi(device=self.device)
         self.moshi = checkpoint_info.get_moshi(device=self.device)
         self.text_tokenizer = checkpoint_info.get_text_tokenizer()
 
+        # torch.compile with CUDA graphs - beneficial on Ampere+ GPUs
+        # Disable on T4 or for debugging with TORCH_COMPILE=0
+        use_compile = os.getenv("TORCH_COMPILE", "auto")
+        if use_compile == "auto":
+            # Auto-detect: enable for Ampere+ (compute capability >= 8.0)
+            if self.device == "cuda":
+                capability = torch.cuda.get_device_capability()
+                use_compile = capability[0] >= 8  # Ampere is 8.0, Turing (T4) is 7.5
+            else:
+                use_compile = False
+        else:
+            use_compile = use_compile == "1"
+
+        if use_compile:
+            print("Compiling mimi encoder with torch.compile (Ampere+ GPU detected)...")
+            self.mimi.encoder = torch.compile(self.mimi.encoder, mode="reduce-overhead")
+
         # Create language model generator
-        self.lm_gen = LMGen(self.moshi, temp=0, temp_text=0)
+        # temp=0 means greedy decoding (fastest, deterministic)
+        # Higher temp (e.g., 0.8) adds randomness, useful for creative tasks
+        self.lm_gen = LMGen(self.moshi, temp=LM_TEMP, temp_text=LM_TEMP_TEXT)
 
         # Model configuration
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)

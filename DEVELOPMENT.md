@@ -214,6 +214,35 @@ Request arrives
 | `MAX_SESSION_SECONDS` | 3600s | Maximum session duration |
 | `scaledown_window` | 60s | Container idle before shutdown |
 
+### Performance Tuning
+
+GPU-specific optimizations are auto-detected based on compute capability:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `LM_TEMP` | 0 | LM temperature (0 = greedy decoding, fastest) |
+| `LM_TEMP_TEXT` | 0 | Text token temperature |
+| `TORCH_COMPILE` | auto | torch.compile for mimi encoder |
+| TF32 precision | enabled | Tensor core acceleration |
+
+**GPU Compatibility:**
+
+| GPU | Arch | Compute | TF32 | torch.compile (auto) |
+|-----|------|---------|------|---------------------|
+| T4 | Turing | 7.5 | ❌ ignored | ❌ disabled |
+| L4 | Ada | 8.9 | ✅ | ✅ enabled |
+| A10G | Ampere | 8.6 | ✅ | ✅ enabled |
+| A100 | Ampere | 8.0 | ✅ | ✅ enabled |
+| H100 | Hopper | 9.0 | ✅ | ✅ enabled |
+
+**Note**: Greedy decoding (`temp=0`) is optimal for STT - it's both faster and more deterministic. Temperature > 0 adds randomness, which is useful for creative generation tasks but not transcription.
+
+To override torch.compile behavior:
+```bash
+TORCH_COMPILE=1 uvx modal deploy src/stt/modal_app.py  # Force enable
+TORCH_COMPILE=0 uvx modal deploy src/stt/modal_app.py  # Force disable (debugging)
+```
+
 ## Scripts
 
 ### `transcribe_cli.py`
