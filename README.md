@@ -160,23 +160,28 @@ KYUTAI_GPU=L4 MAX_CONCURRENT_SESSIONS=8 uvx modal deploy src/stt/modal_app.py
 
 Modal bills per-second. Choose based on your latency and cost requirements:
 
-| GPU | Cost/Hour | First Token Latency | Best For |
-|-----|-----------|---------------------|----------|
-| **T4** | $0.59 | ~0.7s | Development, low-volume |
-| **L4** | $0.80 | ~0.6s | Good balance of cost/performance |
-| **A10G** | $1.10 | ~0.5s | Production workloads |
-| **A100** | $2.10 | ~0.5s | High throughput, multiple streams |
+| GPU | VRAM | Cost/Hour | First Token (1 stream) | First Token (4 streams) | Max Concurrent |
+|-----|------|-----------|------------------------|------------------------|----------------|
+| **T4** | 16GB | $0.59 | ~0.7s | ~1.4s | 2-4 |
+| **L4** | 24GB | $0.80 | ~0.6s | ~1.1s | 4-8 |
+| **A10G** | 24GB | $1.10 | ~0.5s | ~1.0s | 4-8 |
+| **A100** | 80GB | $2.78 | ~0.5s | ~0.9s | 16+ |
+
+**Benchmarks**: First token latency measured with 8 seconds of audio, 4 parallel streams on warm container.
+
+**Concurrent sessions**: Set via `MAX_CONCURRENT_SESSIONS` (default: 4). Higher values increase throughput but add latency per stream. The limits above are conservative estimates based on VRAM.
 
 ### Benchmark Different GPUs
 
 ```bash
 # Deploy and test each GPU (creates separate apps)
-uv run scripts/latency_test.py --compare-gpus "T4,L4,A10G" -p 4
+uv run scripts/latency_test.py --compare-gpus "T4,L4,A10G,A100" -p 4
 
 # Cleanup after benchmarking
-modal app stop kyutai-stt-t4
-modal app stop kyutai-stt-l4
-modal app stop kyutai-stt-a10g
+uvx modal app stop kyutai-stt-t4
+uvx modal app stop kyutai-stt-l4
+uvx modal app stop kyutai-stt-a10g
+uvx modal app stop kyutai-stt-a100
 ```
 
 ## How It Works
