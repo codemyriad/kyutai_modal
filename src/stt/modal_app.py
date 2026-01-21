@@ -23,6 +23,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
 KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
 MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
 IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "30.0"))
+MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
 
 # Build image with moshi stack
 image = (
@@ -58,10 +59,11 @@ MINUTES = 60
 @app.cls(
     gpu=KYUTAI_GPU,
     volumes=volumes,
-    timeout=30 * MINUTES,
-    scaledown_window=2 * MINUTES,
+    timeout=10 * MINUTES,  # Max 10 min per request (prevents stuck connections)
+    scaledown_window=60,  # 1 minute idle before scale down
     max_containers=2,
     min_containers=0,
+    buffer_containers=0,  # No buffer containers
     enable_memory_snapshot=False,  # Disabled: moshi streaming state doesn't survive snapshots
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_SESSIONS)
@@ -248,6 +250,7 @@ class KyutaiSTTService:
             await ws.accept()
             print("Session started")
 
+            session_start = time.monotonic()
             bytes_in = 0
             tokens_sent = 0
             all_pcm_data = None
@@ -264,6 +267,11 @@ class KyutaiSTTService:
 
             try:
                 while True:
+                    # Enforce max session duration
+                    if time.monotonic() - session_start > MAX_SESSION_SECONDS:
+                        print(f"[ws] max session duration reached ({MAX_SESSION_SECONDS}s)")
+                        break
+
                     try:
                         data = await asyncio.wait_for(
                             ws.receive_bytes(), timeout=IDLE_AUDIO_TIMEOUT_SECONDS
