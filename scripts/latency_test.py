@@ -11,10 +11,33 @@ import websockets
 
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
+CHUNK_DURATION_S = 0.08  # 80ms chunks to mirror realtime streaming
 
 
-async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav", auth_headers: dict | None = None):
-    """Send audio and measure time to first response."""
+async def _stream_audio(ws, audio: np.ndarray, sample_rate: int, real_time_factor: float) -> float:
+    """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
+    chunk_size = int(sample_rate * CHUNK_DURATION_S)
+    rtf = max(0.25, real_time_factor)  # avoid zero/negative/too-slow
+    send_start = time.perf_counter()
+
+    for i in range(0, len(audio), chunk_size):
+        chunk = audio[i : i + chunk_size]
+        if chunk.size == 0:
+            continue
+        await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+        # Sleep to simulate live streaming (faster if rtf > 1.0)
+        await asyncio.sleep(len(chunk) / sample_rate / rtf)
+
+    return time.perf_counter() - send_start
+
+
+async def measure_latency(
+    uri: str,
+    wav_path: str = "samples/wav24k/chunk_0.wav",
+    auth_headers: dict | None = None,
+    real_time_factor: float = 1.0,
+):
+    """Send audio in streaming chunks and measure token latencies."""
     import soundfile as sf
 
     # Load real audio file
@@ -40,36 +63,45 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
         connect_time = time.perf_counter() - connect_start
         print(f"Connected in {connect_time:.2f}s")
 
-        # Send all audio at once (raw PCM float32 LE, 24kHz mono)
-        send_start = time.perf_counter()
-        await ws.send(pcm_bytes)
-        send_time = time.perf_counter() - send_start
-        print(f"Sent {len(pcm_bytes)} bytes in {send_time:.3f}s")
+        # Stream audio in chunks to mirror realtime usage
+        print(f"Streaming audio at {real_time_factor}x realtime...")
+        start_time = time.perf_counter()
+        send_task = asyncio.create_task(_stream_audio(ws, audio, sr, real_time_factor))
 
         # Receive tokens
-        recv_start = time.perf_counter()
-        first_token_time = None
-        all_tokens = []
+        tokens = []
+        token_times = []
+        last_msg_ts = time.perf_counter()
 
         try:
             while True:
-                msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                # Stop after inactivity once audio is fully sent
+                timeout = 2.0
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
+                        break
+                    continue
+
                 data = json.loads(msg)
+                last_msg_ts = time.perf_counter()
 
                 if data.get("type") == "token":
                     text = data.get("text", "")
-                    all_tokens.append(text)
-                    if first_token_time is None:
-                        first_token_time = time.perf_counter() - recv_start
-                        print(f"First token in {first_token_time:.3f}s: '{text}'")
+                    tokens.append(text)
+                    token_times.append(last_msg_ts - start_time)
+                    if len(token_times) == 1:
+                        print(f"First token in {token_times[0]:.3f}s: '{text}'")
                 elif data.get("type") == "vad_end":
                     print("VAD end detected")
                 elif data.get("type") == "ping":
                     pass  # Server keepalive, ignore
                 elif "text" in data:  # Legacy format
-                    if first_token_time is None:
-                        first_token_time = time.perf_counter() - recv_start
-                        print(f"First response in {first_token_time:.3f}s: {data.get('text', '')[:50]}")
+                    tokens.append(data.get("text", ""))
+                    token_times.append(last_msg_ts - start_time)
+                    if len(token_times) == 1:
+                        print(f"First response in {token_times[0]:.3f}s: {data.get('text', '')[:50]}")
                 elif data.get("status") == "complete":
                     break
         except asyncio.TimeoutError:
@@ -77,32 +109,40 @@ async def measure_latency(uri: str, wav_path: str = "samples/wav24k/chunk_0.wav"
         except websockets.exceptions.ConnectionClosed:
             print("Connection closed (session ended)")
 
-        total_time = time.perf_counter() - send_start
-        full_text = "".join(all_tokens)
+        send_time = await send_task
+        total_time = time.perf_counter() - start_time
+        full_text = "".join(tokens)
 
         print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
         print(f"  Connect: {connect_time:.2f}s")
         print(f"  Send: {send_time:.3f}s")
-        print(f"  First token: {first_token_time:.3f}s" if first_token_time else "  No tokens received")
-        print(f"  Total tokens: {len(all_tokens)}")
+        if token_times:
+            late = token_times[min(len(token_times) - 1, 9)]
+            print(f"  First token: {token_times[0]:.3f}s")
+            print(f"  10th token: {late:.3f}s" if len(token_times) >= 10 else f"  Last token: {token_times[-1]:.3f}s")
+            print(f"  Final token: {token_times[-1]:.3f}s")
+        else:
+            print("  No tokens received")
+        print(f"  Total tokens: {len(tokens)}")
 
         return {
             "connect_time": connect_time,
             "send_time": send_time,
-            "first_token_time": first_token_time,
+            "first_token_time": token_times[0] if token_times else None,
+            "last_token_time": token_times[-1] if token_times else None,
             "total_time": total_time,
-            "token_count": len(all_tokens),
+            "token_count": len(tokens),
         }
 
 
-async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_headers: dict | None, warmup: bool = True):
+async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, warmup: bool = True):
     """Run multiple streams in parallel to test concurrent handling."""
 
     if warmup:
         print("Warmup request (excludes cold boot from stats)...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers)
+            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
             print("Warmup complete.\n")
         except Exception as e:
             print(f"Warmup failed: {e}\n")
@@ -110,7 +150,7 @@ async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_head
     print(f"Running {num_streams} parallel streams...")
 
     async def labeled_test(idx: int):
-        result = await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers)
+        result = await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
         return idx, result
 
     tasks = [labeled_test(i) for i in range(num_streams)]
@@ -128,7 +168,13 @@ async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_head
             idx, metrics = result
             if metrics.get("first_token_time"):
                 successful.append(metrics["first_token_time"])
-                print(f"  Stream {i+1}: first_token={metrics['first_token_time']:.3f}s, tokens={metrics['token_count']}")
+                last = metrics.get("last_token_time")
+                print(
+                    f"  Stream {i+1}: "
+                    f"first={metrics['first_token_time']:.3f}s, "
+                    f"last={(last if last is not None else float('nan')):.3f}s, "
+                    f"tokens={metrics['token_count']}"
+                )
             else:
                 print(f"  Stream {i+1}: No tokens received")
 
@@ -171,7 +217,7 @@ async def deploy_gpu_variant(gpu: str, auth_headers: dict | None) -> str | None:
     return get_app_url(app_name)
 
 
-async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_headers: dict | None):
+async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float):
     """Deploy each GPU to separate apps, then test all in parallel."""
     import subprocess
 
@@ -199,7 +245,7 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     async def warmup_one(gpu: str, uri: str):
         print(f"  Warming up {gpu}...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers)
+            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor)
             print(f"  {gpu} warm")
             return True
         except Exception as e:
@@ -217,7 +263,7 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     results = {}
     for gpu, uri in gpu_urls.items():
         print(f"\n--- {gpu} ---")
-        latencies = await run_parallel_test(uri, num_streams, wav_path, auth_headers, warmup=False)
+        latencies = await run_parallel_test(uri, num_streams, wav_path, auth_headers, real_time_factor, warmup=False)
         if latencies:
             results[gpu] = {
                 "avg": sum(latencies) / len(latencies),
@@ -255,6 +301,8 @@ async def main():
                         help="Number of test runs (sequential mode)")
     parser.add_argument("--wav", type=str, default="samples/wav24k/chunk_0.wav",
                         help="Path to test audio file")
+    parser.add_argument("--rtf", type=float, default=1.0,
+                        help="Realtime factor for streaming (1.0=real time, 2.0=2x faster, 4.0=4x)")
     parser.add_argument("--compare-gpus", type=str, default="",
                         help="Compare GPUs (comma-separated, e.g., 'T4,L4,A10G,A100')")
     parser.add_argument("--no-warmup", action="store_true",
@@ -274,16 +322,16 @@ async def main():
     if args.compare_gpus:
         gpus = [g.strip() for g in args.compare_gpus.split(",")]
         num_streams = args.parallel if args.parallel > 0 else 3
-        await compare_gpus(gpus, num_streams, args.wav, auth_headers)
+        await compare_gpus(gpus, num_streams, args.wav, auth_headers, args.rtf)
     elif args.parallel > 0:
-        await run_parallel_test(uri, args.parallel, args.wav, auth_headers, warmup=not args.no_warmup)
+        await run_parallel_test(uri, args.parallel, args.wav, auth_headers, args.rtf, warmup=not args.no_warmup)
     else:
         # Sequential mode
         for i in range(args.runs):
             print(f"\n{'='*50}")
             print(f"Test {i+1}/{args.runs}")
             print('='*50)
-            await measure_latency(uri, wav_path=args.wav, auth_headers=auth_headers)
+            await measure_latency(uri, wav_path=args.wav, auth_headers=auth_headers, real_time_factor=args.rtf)
 
 
 if __name__ == "__main__":
