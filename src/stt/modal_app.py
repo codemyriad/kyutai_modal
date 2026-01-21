@@ -105,21 +105,11 @@ class KyutaiSTTService:
         self.moshi = checkpoint_info.get_moshi(device=self.device)
         self.text_tokenizer = checkpoint_info.get_text_tokenizer()
 
-        # torch.compile with CUDA graphs - beneficial on Ampere+ GPUs
-        # Disable on T4 or for debugging with TORCH_COMPILE=0
-        use_compile = os.getenv("TORCH_COMPILE", "auto")
-        if use_compile == "auto":
-            # Auto-detect: enable for Ampere+ (compute capability >= 8.0)
-            if self.device == "cuda":
-                capability = torch.cuda.get_device_capability()
-                use_compile = capability[0] >= 8  # Ampere is 8.0, Turing (T4) is 7.5
-            else:
-                use_compile = False
-        else:
-            use_compile = use_compile == "1"
-
+        # torch.compile can improve throughput but adds ~60s to cold start
+        # Disabled by default; enable with TORCH_COMPILE=1 for high-throughput scenarios
+        use_compile = os.getenv("TORCH_COMPILE", "0") == "1"
         if use_compile:
-            print("Compiling mimi encoder with torch.compile (Ampere+ GPU detected)...")
+            print("Compiling mimi encoder with torch.compile...")
             self.mimi.encoder = torch.compile(self.mimi.encoder, mode="reduce-overhead")
 
         # Create language model generator
