@@ -2,10 +2,14 @@
 """Measure transcription latency for the STT endpoint."""
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
+import sys
 import time
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import numpy as np
 import websockets
@@ -41,6 +45,7 @@ async def _stream_audio(
     sample_rate: int,
     real_time_factor: float,
     progress_update=None,
+    playback_stream=None,
 ) -> float:
     """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
     chunk_size = int(sample_rate * CHUNK_DURATION_S)
@@ -53,6 +58,11 @@ async def _stream_audio(
         if chunk.size == 0:
             continue
         await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+        if playback_stream is not None:
+            try:
+                playback_stream.write(chunk)
+            except Exception:
+                pass
         bytes_sent += chunk.nbytes
         if progress_update:
             progress_update(bytes_sent)
@@ -62,12 +72,30 @@ async def _stream_audio(
     return time.perf_counter() - send_start
 
 
+async def _quit_watcher(stop_event: asyncio.Event):
+    """Watch stdin for 'q' to request stop."""
+    if not sys.stdin.isatty():
+        return
+    loop = asyncio.get_running_loop()
+    while not stop_event.is_set():
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        if line.strip().lower() == "q":
+            print("\nQuit requested (q)")
+            stop_event.set()
+            break
+
+
 async def measure_latency(
     uri: str,
     wav_path: str = "samples/wav24k/chunk_0.wav",
     auth_headers: dict | None = None,
     real_time_factor: float = 1.0,
     expected_text: str | None = None,
+    stop_event: asyncio.Event | None = None,
+    playback: bool = False,
+    playback_device: int | None = None,
 ):
     """Send audio in streaming chunks and measure token latencies."""
     import soundfile as sf
@@ -77,6 +105,31 @@ async def measure_latency(
     if sr != 24000:
         raise ValueError(f"Expected 24kHz, got {sr}")
 
+    # Optional word-level timeline (produced by annotate_samples.py)
+    words_path = f"{wav_path}.words.json"
+    word_timeline = None
+    if os.path.exists(words_path):
+        try:
+            import json as _json
+
+            word_timeline = _json.loads(Path(words_path).read_text(encoding="utf-8"))
+        except Exception:
+            word_timeline = None
+
+    playback_stream = None
+    if playback:
+        try:
+            import sounddevice as sd
+
+            playback_stream = sd.OutputStream(
+                samplerate=sr, channels=1, dtype="float32", device=playback_device
+            )
+            playback_stream.start()
+            print(f"Playback enabled (device: {playback_device or 'default'})")
+        except Exception as exc:
+            print(f"Playback disabled (failed to init): {exc}")
+            playback_stream = None
+
     audio_seconds = len(audio) / 24000
     print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
 
@@ -85,6 +138,9 @@ async def measure_latency(
 
     print(f"Connecting to {uri}...")
     connect_start = time.perf_counter()
+
+    if stop_event and stop_event.is_set():
+        return {}
 
     console = Console() if RICH_AVAILABLE else None
     live = None
@@ -121,6 +177,12 @@ async def measure_latency(
         table.add_row("10th token", fmt(state.get("tenth_token")))
         table.add_row("Last token", fmt(state.get("last_token")))
         table.add_row("Total time", fmt(state.get("total_time")))
+        if state.get("words_total"):
+            table.add_row(
+                "Words",
+                f"{state.get('words_matched', 0)}/{state.get('words_total')} "
+                f"({(state.get('words_matched', 0)/state.get('words_total'))*100:4.1f}%)",
+            )
         if state.get("similarity") is not None:
             table.add_row("Similarity", f"{state['similarity']*100:5.1f}%")
 
@@ -164,6 +226,9 @@ async def measure_latency(
             "expected_text": expected_text,
             "expected_render": None,
             "similarity": None,
+            "word_timeline": word_timeline,
+            "words_matched": 0,
+            "words_total": len(word_timeline) if word_timeline else 0,
         }
 
         if RICH_AVAILABLE:
@@ -181,7 +246,14 @@ async def measure_latency(
                 live.update(render_dashboard())
 
         send_task = asyncio.create_task(
-            _stream_audio(ws, audio, sr, real_time_factor, progress_update=progress_update)
+            _stream_audio(
+                ws,
+                audio,
+                sr,
+                real_time_factor,
+                progress_update=progress_update,
+                playback_stream=playback_stream,
+            )
         )
 
         # Receive tokens
@@ -208,15 +280,29 @@ async def measure_latency(
             if last_idx < len(expected_text):
                 text_out.append(expected_text[last_idx:], style="dim")
             state["expected_render"] = text_out
+            if state.get("word_timeline"):
+                recognized_words = [w.strip(" ,.!?;:").lower() for w in recognized_text.split() if w.strip()]
+                expected_words = [w["word"].strip(" ,.!?;:").lower() for w in state["word_timeline"]]
+                matched = 0
+                for rw, ew in zip(recognized_words, expected_words):
+                    if rw == ew:
+                        matched += 1
+                    else:
+                        break
+                state["words_matched"] = matched
 
         try:
             while True:
+                if stop_event and stop_event.is_set():
+                    break
                 # Stop after inactivity once audio is fully sent
                 timeout = 2.0
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 except asyncio.TimeoutError:
                     if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
+                        break
+                    if stop_event and stop_event.is_set():
                         break
                     continue
 
@@ -265,49 +351,76 @@ async def measure_latency(
         except websockets.exceptions.ConnectionClosed:
             print("Connection closed (session ended)")
 
+        if stop_event and stop_event.is_set() and not send_task.done():
+            send_task.cancel()
+            with contextlib.suppress(Exception):
+                await send_task
         send_time = await send_task
         total_time = time.perf_counter() - start_time
         full_text = "".join(tokens)
         state["send_time"] = send_time
         state["total_time"] = total_time
         state["status"] = "complete"
-        if live:
-            live.update(render_dashboard())
-            live.stop()
+    if live:
+        live.update(render_dashboard())
+        live.stop()
+
+    if playback_stream:
+        with contextlib.suppress(Exception):
+            playback_stream.stop()
+            playback_stream.close()
 
     print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
-        print(f"\nTotal round-trip: {total_time:.3f}s")
-        print(f"  Connect: {connect_time:.2f}s")
-        print(f"  Send: {send_time:.3f}s")
-        if token_times:
-            late = token_times[min(len(token_times) - 1, 9)]
-            print(f"  First token: {token_times[0]:.3f}s")
-            print(f"  10th token: {late:.3f}s" if len(token_times) >= 10 else f"  Last token: {token_times[-1]:.3f}s")
-            print(f"  Final token: {token_times[-1]:.3f}s")
-            if expected_text and state.get("similarity") is not None:
-                print(f"  Similarity vs expected: {state['similarity']*100:5.1f}%")
-        else:
-            print("  No tokens received")
-        print(f"  Total tokens: {len(tokens)}")
+    print(f"\nTotal round-trip: {total_time:.3f}s")
+    print(f"  Connect: {connect_time:.2f}s")
+    print(f"  Send: {send_time:.3f}s")
+    if token_times:
+        late = token_times[min(len(token_times) - 1, 9)]
+        print(f"  First token: {token_times[0]:.3f}s")
+        print(f"  10th token: {late:.3f}s" if len(token_times) >= 10 else f"  Last token: {token_times[-1]:.3f}s")
+        print(f"  Final token: {token_times[-1]:.3f}s")
+        if expected_text and state.get("similarity") is not None:
+            print(f"  Similarity vs expected: {state['similarity']*100:5.1f}%")
+    else:
+        print("  No tokens received")
+    print(f"  Total tokens: {len(tokens)}")
 
-        return {
-            "connect_time": connect_time,
-            "send_time": send_time,
-            "first_token_time": token_times[0] if token_times else None,
-            "last_token_time": token_times[-1] if token_times else None,
-            "total_time": total_time,
-            "token_count": len(tokens),
-            "similarity": state.get("similarity"),
-        }
+    return {
+        "connect_time": connect_time,
+        "send_time": send_time,
+        "first_token_time": token_times[0] if token_times else None,
+        "last_token_time": token_times[-1] if token_times else None,
+        "total_time": total_time,
+        "token_count": len(tokens),
+        "similarity": state.get("similarity"),
+    }
 
 
-async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, expected_text: str | None, warmup: bool = True):
+async def run_parallel_test(
+    uri: str,
+    num_streams: int,
+    wav_path: str,
+    auth_headers: dict | None,
+    real_time_factor: float,
+    expected_text: str | None,
+    warmup: bool = True,
+    stop_event: asyncio.Event | None = None,
+    playback: bool = False,
+    playback_device: int | None = None,
+):
     """Run multiple streams in parallel to test concurrent handling."""
 
     if warmup:
         print("Warmup request (excludes cold boot from stats)...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
+            await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=expected_text,
+                stop_event=stop_event,
+            )
             print("Warmup complete.\n")
         except Exception as e:
             print(f"Warmup failed: {e}\n")
@@ -315,7 +428,16 @@ async def run_parallel_test(uri: str, num_streams: int, wav_path: str, auth_head
     print(f"Running {num_streams} parallel streams...")
 
     async def labeled_test(idx: int):
-        result = await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
+        result = await measure_latency(
+            uri,
+            wav_path=wav_path,
+            auth_headers=auth_headers,
+            real_time_factor=real_time_factor,
+            expected_text=expected_text,
+            stop_event=stop_event,
+            playback=playback,
+            playback_device=playback_device,
+        )
         return idx, result
 
     tasks = [labeled_test(i) for i in range(num_streams)]
@@ -382,7 +504,17 @@ async def deploy_gpu_variant(gpu: str, auth_headers: dict | None) -> str | None:
     return get_app_url(app_name)
 
 
-async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_headers: dict | None, real_time_factor: float, expected_text: str | None):
+async def compare_gpus(
+    gpus: list[str],
+    num_streams: int,
+    wav_path: str,
+    auth_headers: dict | None,
+    real_time_factor: float,
+    expected_text: str | None,
+    stop_event: asyncio.Event | None = None,
+    playback: bool = False,
+    playback_device: int | None = None,
+):
     """Deploy each GPU to separate apps, then test all in parallel."""
     import subprocess
 
@@ -410,7 +542,16 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     async def warmup_one(gpu: str, uri: str):
         print(f"  Warming up {gpu}...")
         try:
-            await measure_latency(uri, wav_path=wav_path, auth_headers=auth_headers, real_time_factor=real_time_factor, expected_text=expected_text)
+            await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=expected_text,
+                stop_event=stop_event,
+                playback=playback,
+                playback_device=playback_device,
+            )
             print(f"  {gpu} warm")
             return True
         except Exception as e:
@@ -428,7 +569,18 @@ async def compare_gpus(gpus: list[str], num_streams: int, wav_path: str, auth_he
     results = {}
     for gpu, uri in gpu_urls.items():
         print(f"\n--- {gpu} ---")
-        latencies = await run_parallel_test(uri, num_streams, wav_path, auth_headers, real_time_factor, expected_text, warmup=False)
+        latencies = await run_parallel_test(
+            uri,
+            num_streams,
+            wav_path,
+            auth_headers,
+            real_time_factor,
+            expected_text,
+            warmup=False,
+            stop_event=stop_event,
+            playback=playback,
+            playback_device=playback_device,
+        )
         if latencies:
             results[gpu] = {
                 "avg": sum(latencies) / len(latencies),
@@ -476,6 +628,10 @@ async def main():
                         help="Expected transcript text (for visualization/quality)")
     parser.add_argument("--expected-file", type=str, default=None,
                         help="Path to expected transcript text file (falls back to <wav>.txt if present)")
+    parser.add_argument("--playback", action="store_true",
+                        help="Play audio locally while streaming")
+    parser.add_argument("--playback-device", type=int, default=None,
+                        help="Output device index for playback (sounddevice)")
     args = parser.parse_args()
 
     uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
@@ -500,20 +656,73 @@ async def main():
         auth_headers = {"Modal-Key": modal_key, "Modal-Secret": modal_secret}
         print("Using Modal proxy authentication\n")
 
-    if args.compare_gpus:
-        gpus = [g.strip() for g in args.compare_gpus.split(",")]
-        num_streams = args.parallel if args.parallel > 0 else 3
-        await compare_gpus(gpus, num_streams, args.wav, auth_headers, args.rtf, expected_text)
-    elif args.parallel > 0:
-        await run_parallel_test(uri, args.parallel, args.wav, auth_headers, args.rtf, expected_text, warmup=not args.no_warmup)
-    else:
-        # Sequential mode
-        for i in range(args.runs):
-            print(f"\n{'='*50}")
-            print(f"Test {i+1}/{args.runs}")
-            print('='*50)
-            await measure_latency(uri, wav_path=args.wav, auth_headers=auth_headers, real_time_factor=args.rtf, expected_text=expected_text)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    except NotImplementedError:
+        pass
+    quit_task = asyncio.create_task(_quit_watcher(stop_event))
+
+    try:
+        if args.compare_gpus:
+            gpus = [g.strip() for g in args.compare_gpus.split(",")]
+            num_streams = args.parallel if args.parallel > 0 else 3
+            await compare_gpus(
+                gpus,
+                num_streams,
+                args.wav,
+                auth_headers,
+                args.rtf,
+                expected_text,
+                stop_event=stop_event,
+                playback=args.playback,
+                playback_device=args.playback_device,
+            )
+        elif args.parallel > 0:
+            await run_parallel_test(
+                uri,
+                args.parallel,
+                args.wav,
+                auth_headers,
+                args.rtf,
+                expected_text,
+                warmup=not args.no_warmup,
+                stop_event=stop_event,
+                playback=args.playback,
+                playback_device=args.playback_device,
+            )
+        else:
+            # Sequential mode
+            for i in range(args.runs):
+                print(f"\n{'='*50}")
+                print(f"Test {i+1}/{args.runs}")
+                print('='*50)
+                await measure_latency(
+                    uri,
+                    wav_path=args.wav,
+                    auth_headers=auth_headers,
+                    real_time_factor=args.rtf,
+                    expected_text=expected_text,
+                    stop_event=stop_event,
+                    playback=args.playback,
+                    playback_device=args.playback_device,
+                )
+                if stop_event.is_set():
+                    break
+    finally:
+        stop_event.set()
+        quit_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await quit_task
+        # Restore terminal if rich left it in alt screen
+        if RICH_AVAILABLE and console:
+            with contextlib.suppress(Exception):
+                console.print("\033[?1049l")  # exit alt screen
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted, exiting cleanly.")
