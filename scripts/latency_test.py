@@ -669,6 +669,8 @@ async def main():
                         help="Play audio locally while streaming")
     parser.add_argument("--playback-device", type=int, default=None,
                         help="Output device index for playback (sounddevice)")
+    parser.add_argument("--all-samples", action="store_true",
+                        help="Run over all wavs in samples/wav24k instead of a single file")
     args = parser.parse_args()
 
     uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
@@ -731,20 +733,32 @@ async def main():
             )
         else:
             # Sequential mode
-            for i in range(args.runs):
-                print(f"\n{'='*50}")
-                print(f"Test {i+1}/{args.runs}")
-                print('='*50)
-                await measure_latency(
-                    uri,
-                    wav_path=args.wav,
-                    auth_headers=auth_headers,
-                    real_time_factor=args.rtf,
-                    expected_text=expected_text,
-                    stop_event=stop_event,
-                    playback=args.playback,
-                    playback_device=args.playback_device,
-                )
+            wav_paths = []
+            if args.all_samples:
+                wav_paths = sorted(Path("samples/wav24k").glob("*.wav"))
+                if not wav_paths:
+                    print("No wav files found in samples/wav24k")
+                    return
+            else:
+                wav_paths = [Path(args.wav)]
+
+            for wav_path in wav_paths:
+                for i in range(args.runs):
+                    print(f"\n{'='*50}")
+                    print(f"Test {i+1}/{args.runs} - {wav_path.name}")
+                    print('='*50)
+                    await measure_latency(
+                        uri,
+                        wav_path=str(wav_path),
+                        auth_headers=auth_headers,
+                        real_time_factor=args.rtf,
+                        expected_text=expected_text,
+                        stop_event=stop_event,
+                        playback=args.playback,
+                        playback_device=args.playback_device,
+                    )
+                    if stop_event.is_set():
+                        break
                 if stop_event.is_set():
                     break
     finally:
