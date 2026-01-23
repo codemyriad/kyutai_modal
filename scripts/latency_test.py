@@ -15,14 +15,14 @@ import numpy as np
 import websockets
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
     from rich.text import Text
 
     RICH_AVAILABLE = True
 except Exception:
-    Console = Live = Panel = Text = None
+    Console = Live = Panel = Text = Group = None
     RICH_AVAILABLE = False
 
 
@@ -80,11 +80,15 @@ def _words_match(w1: str, w2: str) -> bool:
 
 def _color_diff(expected: str, actual: str) -> str:
     """
-    Color the actual text using LCS alignment with expected.
+    Color the actual text using greedy prefix-aligned matching.
 
     - Green: matching words
     - Red: extra words in actual (not in expected)
-    - Dim: missing words (in expected but not actual)
+    - Dim + strikethrough: missing words (skipped in expected)
+    - Dim: pending words (not yet reached in expected)
+
+    Uses greedy matching optimized for streaming transcription:
+    each actual word matches with the earliest available expected word.
     """
     if not actual:
         return "[dim]...[/dim]"
@@ -92,56 +96,32 @@ def _color_diff(expected: str, actual: str) -> str:
     exp_words = expected.split()
     act_words = actual.split()
 
-    # Build LCS table
-    m, n = len(exp_words), len(act_words)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if _words_match(exp_words[i-1], act_words[j-1]):
-                dp[i][j] = dp[i-1][j-1] + 1
-            else:
-                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-
-    # Backtrack to find alignment
-    i, j = m, n
-    ops = []
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and _words_match(exp_words[i-1], act_words[j-1]):
-            ops.append(("match", act_words[j-1]))
-            i -= 1
-            j -= 1
-        elif j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j]):
-            ops.append(("extra", act_words[j-1]))
-            j -= 1
-        else:
-            ops.append(("missing", exp_words[i-1]))
-            i -= 1
-
-    ops.reverse()
-
-    # Find where trailing missing words start (future text, not errors)
-    # Trailing = consecutive "missing" ops at the end
-    trailing_start = len(ops)
-    for idx in range(len(ops) - 1, -1, -1):
-        if ops[idx][0] == "missing":
-            trailing_start = idx
-        else:
-            break
-
-    # Render with colors
+    # Greedy prefix-aligned matching
     parts = []
-    for idx, (op, word) in enumerate(ops):
-        if op == "match":
-            parts.append(f"[green]{word}[/green]")
-        elif op == "extra":
-            parts.append(f"[red]{word}[/red]")
-        elif idx >= trailing_start:
-            # Trailing missing = future text, just dim
-            parts.append(f"[dim]{word}[/dim]")
+    exp_idx = 0
+
+    for act_word in act_words:
+        # Find the first matching expected word from current position
+        found_idx = None
+        for i in range(exp_idx, len(exp_words)):
+            if _words_match(exp_words[i], act_word):
+                found_idx = i
+                break
+
+        if found_idx is not None:
+            # Mark all skipped expected words as missing (strikethrough)
+            for j in range(exp_idx, found_idx):
+                parts.append(f"[dim strike]{exp_words[j]}[/dim strike]")
+            # Mark this as a match
+            parts.append(f"[green]{act_word}[/green]")
+            exp_idx = found_idx + 1
         else:
-            # Missing in middle/start = incorrectly skipped, strikethrough
-            parts.append(f"[dim strike]{word}[/dim strike]")
+            # No match found - this is an extra word
+            parts.append(f"[red]{act_word}[/red]")
+
+    # Remaining expected words are pending (future text, just dim)
+    for i in range(exp_idx, len(exp_words)):
+        parts.append(f"[dim]{exp_words[i]}[/dim]")
 
     return " ".join(parts)
 
@@ -396,27 +376,22 @@ async def measure_latency(
             )
 
             # Receive tokens
-            tokens = []
-            token_times = []
+            tokens: list[str] = []
+            token_times: list[float] = []
             last_msg_ts = time.perf_counter()
-            recognized_text = ""
             send_time = 0.0  # Will be updated when send_task completes
-
-            def update_recognized():
-                state["recognized_text"] = recognized_text
 
             def handle_token(text: str):
                 """Process a received token and update state."""
-                nonlocal recognized_text
                 tokens.append(text)
-                recognized_text = "".join(tokens)
                 token_times.append(last_msg_ts - start_time)
+                # Update state directly (avoid closure issues)
+                state["recognized_text"] = "".join(tokens)
+                state["tokens"] = len(tokens)
+                state["bear_idx"] = len(tokens)
                 if len(token_times) == 1:
                     state["first_token"] = token_times[0]
                     state["first_token_text"] = text
-                state["tokens"] = len(tokens)
-                state["bear_idx"] = len(tokens)
-                update_recognized()
                 if live:
                     live.update(render())
 
@@ -672,23 +647,117 @@ async def run_parallel_test(
         except Exception as e:
             print(f"Warmup failed: {e}\n")
 
-    print(f"Running {num_streams} parallel streams...")
+    if not RICH_AVAILABLE:
+        # Fallback: run without TUI
+        print(f"Running {num_streams} parallel streams...")
 
-    async def labeled_test(idx: int):
-        result = await measure_latency(
-            uri,
-            wav_path=wav_path,
-            auth_headers=auth_headers,
-            real_time_factor=real_time_factor,
-            expected_text=expected_text,
-            stop_event=stop_event,
-            playback=playback,
-            playback_device=playback_device,
-        )
-        return idx, result
+        async def labeled_test(idx: int):
+            result = await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=expected_text,
+                stop_event=stop_event,
+                playback=playback,
+                playback_device=playback_device,
+            )
+            return idx, result
 
-    tasks = [labeled_test(i) for i in range(num_streams)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [labeled_test(i) for i in range(num_streams)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        # TUI mode: show all parallel streams
+        console = Console()
+        bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
+
+        # Create a state dict for each stream
+        states = [{} for _ in range(num_streams)]
+
+        def render_stream_panel(idx: int, state: dict) -> Panel:
+            """Render a single stream's panel."""
+            def fmt(v):
+                return f"[cyan]{v:.2f}s[/cyan]" if v is not None else "[dim]--[/dim]"
+
+            status = state.get("status", "pending")
+            if status == "connecting" and state.get("connect_start"):
+                elapsed = time.perf_counter() - state["connect_start"]
+                status = f"[yellow]connecting ({elapsed:.1f}s)[/yellow]"
+            elif status == "streaming":
+                status = f"[cyan]{status}[/cyan]"
+            elif status == "complete":
+                status = f"[green]{status}[/green]"
+            elif status.startswith("error"):
+                status = f"[red]{status}[/red]"
+            else:
+                status = f"[dim]{status}[/dim]"
+
+            pct = state["sent_bytes"] / state["total_bytes"] if state.get("total_bytes") else 0.0
+            bar_len = 20
+            filled = int(bar_len * pct)
+            bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim]"
+
+            lines = []
+            lines.append(f"[dim]{state.get('audio_len', 0):.1f}s @ {state.get('rtf', 1.0)}x[/dim]  {status}  [dim]connect:[/dim]{fmt(state.get('connect_time'))}  [dim]first:[/dim]{fmt(state.get('first_token'))}")
+            lines.append(f"{bar} {pct*100:5.1f}%")
+
+            if state.get("expected_text"):
+                expected = state["expected_text"]
+                actual = state.get("recognized_text", "")
+                lines.append(f"[blue]expect:[/blue] {expected}")
+                lines.append(f"[blue]actual:[/blue] {_color_diff(expected, actual)}")
+
+            bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
+            content = "\n".join(lines)
+            return Panel(content, title=f"[magenta]{bear} Stream {idx+1}[/magenta]", border_style="magenta", padding=(0, 1))
+
+        def render_all():
+            """Render all stream panels stacked vertically."""
+            panels = [render_stream_panel(i, states[i]) for i in range(num_streams)]
+            return Group(*panels)
+
+        live = Live(render_all(), console=console, refresh_per_second=12, screen=True)
+        live.start()
+
+        # Background task to keep display updated
+        update_running = True
+
+        async def update_display():
+            while update_running:
+                live.update(render_all())
+                await asyncio.sleep(0.1)
+
+        update_task = asyncio.create_task(update_display())
+
+        async def labeled_test(idx: int):
+            # Create a render function that updates just this stream's panel but refreshes all
+            def stream_render():
+                return render_all()
+
+            result = await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=expected_text,
+                stop_event=stop_event,
+                playback=playback if idx == 0 else False,  # Only first stream plays audio
+                playback_device=playback_device,
+                live=live,
+                render_fn=stream_render,
+                state=states[idx],
+            )
+            return idx, result
+
+        tasks = [labeled_test(i) for i in range(num_streams)]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            update_running = False
+            update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await update_task
+            live.stop()
 
     print(f"\n{'='*50}")
     print("Parallel Test Summary")
