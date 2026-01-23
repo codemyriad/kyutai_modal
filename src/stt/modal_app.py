@@ -24,7 +24,7 @@ import modal
 # Configuration
 MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
 KYUTAI_GPU = os.getenv("KYUTAI_GPU", "L40S")  # L40S recommended for Rust server
-APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")
+APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt-rust")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))  # 8 for testing, 64 for L40S production
 RUST_SERVER_PORT = 8998  # Internal port for Rust server
 
@@ -145,7 +145,7 @@ dim = 6
     min_containers=0,
 )
 @modal.concurrent(max_inputs=BATCH_SIZE)
-class KyutaiSTTService:
+class KyutaiSTTRustService:
     """Proxy service: accepts PCM, encodes to Opus, forwards to Rust server."""
 
     @modal.enter()

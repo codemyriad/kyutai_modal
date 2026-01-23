@@ -69,7 +69,7 @@ Speak into your microphone and see real-time transcription.
 
 ### WebSocket API
 
-Connect to `wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream`
+Connect to `wss://{MODAL_WORKSPACE}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream`
 
 **Protocol:**
 - **Client sends**: Raw PCM float32 (little-endian) audio bytes (24kHz mono). Send in ~80ms chunks for low latency.
@@ -94,7 +94,7 @@ import os
 
 async def transcribe():
     workspace = os.environ["MODAL_WORKSPACE"]
-    uri = f"wss://{workspace}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+    uri = f"wss://{workspace}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
     headers = {
         "Modal-Key": os.environ["MODAL_KEY"],
         "Modal-Secret": os.environ["MODAL_SECRET"],

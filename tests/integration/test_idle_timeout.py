@@ -22,7 +22,7 @@ import websockets
 
 # Test configuration
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
-DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
 IDLE_TIMEOUT_SECONDS = 10  # Expected server idle timeout (should match IDLE_AUDIO_TIMEOUT_SECONDS)
 
 

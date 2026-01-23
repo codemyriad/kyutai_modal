@@ -820,7 +820,7 @@ async def run_parallel_test(
 def get_app_url(app_name: str) -> str:
     """Get WebSocket URL for a Modal app."""
     # Modal URL pattern: wss://{workspace}--{app-name}-{class}-{method}.modal.run
-    return f"wss://{MODAL_WORKSPACE}--{app_name}-kyutaisttservice-serve.modal.run/v1/stream"
+    return f"wss://{MODAL_WORKSPACE}--{app_name}-kyutaisttrustservice-serve.modal.run/v1/stream"
 
 
 async def deploy_gpu_variant(gpu: str, auth_headers: dict | None) -> str | None:
@@ -982,7 +982,7 @@ async def main():
     if args.url:
         uri = args.url
     else:
-        uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+        uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
 
     def load_expected_text(wav_path: str, explicit_text: str | None = None, explicit_file: str | None = None) -> str | None:
         """Load expected transcript text for a wav file."""

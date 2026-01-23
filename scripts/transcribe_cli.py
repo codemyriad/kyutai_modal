@@ -56,7 +56,7 @@ except ImportError:
 # ------------------------------------------------------------------------------
 
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
-DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
 
 SAMPLE_RATE = 24000  # Kyutai expects 24kHz audio
 CHANNELS = 1

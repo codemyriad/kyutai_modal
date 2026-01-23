@@ -123,6 +123,6 @@ async def test_stt_server(url: str, wav_path: str):
 
 
 if __name__ == "__main__":
-    url = sys.argv[1] if len(sys.argv) > 1 else "wss://silviot--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+    url = sys.argv[1] if len(sys.argv) > 1 else "wss://silviot--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
     wav = sys.argv[2] if len(sys.argv) > 2 else "samples/wav24k/chunk_0.wav"
     asyncio.run(test_stt_server(url, wav))

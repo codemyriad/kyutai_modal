@@ -284,10 +284,10 @@ KYUTAI_GPU=A10G KYUTAI_APP_NAME=kyutai-stt-a10g uvx modal deploy src/stt/modal_a
 uvx modal container list
 
 # View logs
-uvx modal app logs kyutai-stt
+uvx modal app logs kyutai-stt-rust
 
 # Stop app (all containers)
-uvx modal app stop kyutai-stt
+uvx modal app stop kyutai-stt-rust
 ```
 
 ## Troubleshooting
