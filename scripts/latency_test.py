@@ -133,22 +133,12 @@ async def _stream_audio(
     real_time_factor: float,
     progress_update=None,
     playback_buffer=None,
-    use_msgpack: bool = False,
 ) -> float:
-    """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed.
-
-    Args:
-        use_msgpack: If True, encode audio as msgpack for Rust server.
-                    Format: {"type": "Audio", "pcm": [float, ...]}
-    """
+    """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
     chunk_size = int(sample_rate * CHUNK_DURATION_S)
     rtf = max(0.25, real_time_factor)  # avoid zero/negative/too-slow
     send_start = time.perf_counter()
     bytes_sent = 0
-
-    # Import msgpack only if needed
-    if use_msgpack:
-        import msgpack
 
     try:
         for i in range(0, len(audio), chunk_size):
@@ -156,14 +146,8 @@ async def _stream_audio(
             if chunk.size == 0:
                 continue
 
-            if use_msgpack:
-                # Rust server expects msgpack-encoded messages
-                msg = {"type": "Audio", "pcm": [float(x) for x in chunk]}
-                data = msgpack.packb(msg, use_bin_type=True, use_single_float=True)
-                await ws.send(data)
-            else:
-                # Python server expects raw PCM bytes
-                await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+            # Send raw PCM float32 bytes
+            await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
 
             if playback_buffer is not None:
                 playback_buffer.write(chunk)
@@ -224,7 +208,6 @@ async def measure_latency(
     render_fn: "callable | None" = None,
     state: dict | None = None,
     quiet: bool = False,
-    use_msgpack: bool = False,
 ):
     """Send audio in streaming chunks and measure token latencies.
 
@@ -411,7 +394,6 @@ async def measure_latency(
                     real_time_factor,
                     progress_update=progress_update,
                     playback_buffer=playback_buffer,
-                    use_msgpack=use_msgpack,
                 )
             )
 
@@ -452,50 +434,20 @@ async def measure_latency(
 
                     last_msg_ts = time.perf_counter()
 
-                    if use_msgpack:
-                        # Rust server sends msgpack-encoded messages
-                        # Text messages are prefixed with 0x01 byte
-                        import msgpack
-                        if isinstance(msg, bytes):
-                            if len(msg) > 0 and msg[0] == 0x01:
-                                # Text message - decode the rest as UTF-8
-                                text = msg[1:].decode("utf-8", errors="replace")
-                                if text:
-                                    handle_token(text)
-                            else:
-                                # Try msgpack decode
-                                try:
-                                    data = msgpack.unpackb(msg, raw=False)
-                                    if isinstance(data, dict):
-                                        if data.get("type") == "Text":
-                                            handle_token(data.get("text", ""))
-                                        elif data.get("type") == "VadEnd":
-                                            state["vad_end"] = True
-                                except Exception:
-                                    pass  # Ignore unparseable messages
-                        else:
-                            # String message - might be JSON
-                            try:
-                                data = json.loads(msg)
-                                if data.get("type") == "token":
-                                    handle_token(data.get("text", ""))
-                            except Exception:
-                                pass
-                    else:
-                        # Python server sends JSON
-                        data = json.loads(msg)
+                    # Server sends JSON messages
+                    data = json.loads(msg)
 
-                        msg_type = data.get("type")
-                        if msg_type == "token":
-                            handle_token(data.get("text", ""))
-                        elif msg_type == "vad_end":
-                            state["vad_end"] = True
-                        elif msg_type == "ping":
-                            pass  # Server keepalive
-                        elif "text" in data:  # Legacy format
-                            handle_token(data.get("text", ""))
-                        elif data.get("status") == "complete":
-                            break
+                    msg_type = data.get("type")
+                    if msg_type == "token":
+                        handle_token(data.get("text", ""))
+                    elif msg_type == "vad_end":
+                        state["vad_end"] = True
+                    elif msg_type == "ping":
+                        pass  # Server keepalive
+                    elif "text" in data:  # Legacy format
+                        handle_token(data.get("text", ""))
+                    elif data.get("status") == "complete":
+                        break
             except asyncio.TimeoutError:
                 pass  # Expected for streaming
             except websockets.exceptions.ConnectionClosed:
@@ -563,7 +515,6 @@ async def run_sequential_samples(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
-    use_msgpack: bool = False,
 ):
     """Run multiple samples sequentially with a persistent TUI."""
     if not RICH_AVAILABLE:
@@ -583,7 +534,6 @@ async def run_sequential_samples(
                     stop_event=stop_event,
                     playback=playback,
                     playback_device=playback_device,
-                    use_msgpack=use_msgpack,
                 )
                 if stop_event and stop_event.is_set():
                     break
@@ -668,7 +618,6 @@ async def run_sequential_samples(
                     live=live,
                     render_fn=render,
                     state=state,
-                    use_msgpack=use_msgpack,
                 )
                 session["results"].append({
                     "file": wav_path.name,
@@ -704,7 +653,6 @@ async def run_parallel_test(
     playback: bool = False,
     playback_device: int | None = None,
     no_tui: bool = False,
-    use_msgpack: bool = False,
 ):
     """Run multiple streams in parallel to test concurrent handling."""
 
@@ -726,7 +674,6 @@ async def run_parallel_test(
                 playback=False,
                 playback_device=None,
                 quiet=True,
-                use_msgpack=use_msgpack,
             )
             return idx, result
 
@@ -822,7 +769,6 @@ async def run_parallel_test(
                 render_fn=render_all,
                 state=states[idx],
                 quiet=False,
-                use_msgpack=use_msgpack,
             )
             return idx, result
 
@@ -912,7 +858,6 @@ async def compare_gpus(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
-    use_msgpack: bool = False,
 ):
     """Deploy each GPU to separate apps, then test all in parallel."""
     # Step 1: Deploy all GPU variants (can be done in parallel)
@@ -948,7 +893,6 @@ async def compare_gpus(
                 stop_event=stop_event,
                 playback=playback,
                 playback_device=playback_device,
-                use_msgpack=use_msgpack,
             )
             print(f"  {gpu} warm")
             return True
@@ -977,7 +921,6 @@ async def compare_gpus(
             stop_event=stop_event,
             playback=playback,
             playback_device=playback_device,
-            use_msgpack=use_msgpack,
         )
         if latencies:
             results[gpu] = {
@@ -1034,17 +977,12 @@ async def main():
                         help="Disable TUI mode for parallel tests (debug)")
     parser.add_argument("--url", type=str, default=None,
                         help="Custom WebSocket URL (overrides default Modal URL)")
-    parser.add_argument("--rust-server", action="store_true",
-                        help="Use Rust server auth (kyutai-api-key header instead of Modal auth)")
     args = parser.parse_args()
 
     if args.url:
         uri = args.url
     else:
         uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
-
-    # Use msgpack encoding for Rust server
-    use_msgpack = args.rust_server
 
     def load_expected_text(wav_path: str, explicit_text: str | None = None, explicit_file: str | None = None) -> str | None:
         """Load expected transcript text for a wav file."""
@@ -1065,16 +1003,11 @@ async def main():
 
     # Auth from environment
     auth_headers = None
-    if args.rust_server:
-        # Rust server uses kyutai-api-key header
-        auth_headers = {"kyutai-api-key": "public_token"}
-        print("Using Rust server authentication (kyutai-api-key)\n")
-    else:
-        modal_key = os.environ.get("MODAL_KEY")
-        modal_secret = os.environ.get("MODAL_SECRET")
-        if modal_key and modal_secret:
-            auth_headers = {"Modal-Key": modal_key, "Modal-Secret": modal_secret}
-            print("Using Modal proxy authentication\n")
+    modal_key = os.environ.get("MODAL_KEY")
+    modal_secret = os.environ.get("MODAL_SECRET")
+    if modal_key and modal_secret:
+        auth_headers = {"Modal-Key": modal_key, "Modal-Secret": modal_secret}
+        print("Using Modal proxy authentication\n")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1109,7 +1042,6 @@ async def main():
                 stop_event=stop_event,
                 playback=args.playback,
                 playback_device=args.playback_device,
-                use_msgpack=use_msgpack,
             )
         elif args.parallel > 0:
             # Parallel mode: run streams in parallel, cycling through samples
@@ -1130,7 +1062,6 @@ async def main():
                     playback=args.playback,
                     playback_device=args.playback_device,
                     no_tui=args.no_tui,
-                    use_msgpack=use_msgpack,
                 )
                 if stop_event and stop_event.is_set():
                     break
@@ -1151,7 +1082,6 @@ async def main():
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
-                    use_msgpack=use_msgpack,
                 )
             else:
                 # Single sample, single run - use simple mode
@@ -1164,7 +1094,6 @@ async def main():
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
-                    use_msgpack=use_msgpack,
                 )
     finally:
         stop_event.set()
