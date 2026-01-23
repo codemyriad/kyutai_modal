@@ -322,9 +322,9 @@ class KyutaiSTTRustService:
                                                 if text:
                                                     # Convert sentencepiece space marker to regular space
                                                     text = text.replace("\u2581", " ")
-                                                    # Add leading space if token starts with a letter
+                                                    # Add leading space if token starts with alphanumeric
                                                     # and doesn't already have a leading space
-                                                    if text and text[0].isalpha():
+                                                    if text and text[0].isalnum():
                                                         text = " " + text
                                                     await send_json({"type": "token", "text": text})
                                                     tokens_sent += 1
