@@ -502,6 +502,7 @@ async def measure_latency(
         "first_token_time": token_times[0] if token_times else None,
         "total_time": total_time,
         "token_count": len(tokens),
+        "recognized_text": "".join(tokens),
     }
 
 
@@ -788,6 +789,7 @@ async def run_parallel_test(
     print('='*50)
 
     successful = []
+    recognized_text = None
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             print(f"  Stream {i+1}: FAILED - {type(result).__name__}: {result}")
@@ -802,6 +804,9 @@ async def run_parallel_test(
                     f"last={(last if last is not None else float('nan')):.3f}s, "
                     f"tokens={metrics['token_count']}"
                 )
+                # Capture recognized text from first successful result
+                if recognized_text is None:
+                    recognized_text = metrics.get("recognized_text", "")
             else:
                 # Show diagnostic info
                 connect = metrics.get("connect_time")
@@ -813,6 +818,9 @@ async def run_parallel_test(
         print(f"\n  Avg first token: {sum(successful)/len(successful):.3f}s")
         print(f"  Min first token: {min(successful):.3f}s")
         print(f"  Max first token: {max(successful):.3f}s")
+
+    if recognized_text:
+        print(f"\n  Transcription: {recognized_text.strip()}")
 
     return successful
 
