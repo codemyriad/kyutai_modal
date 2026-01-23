@@ -129,42 +129,35 @@ uv run pytest tests/integration_gpu/ -v -m gpu
 ### Streaming Flow
 
 ```
-Client                          Server (Modal)
-  │                                  │
-  │  ──Raw PCM float32 bytes─────►   │
-  │                                  │  numpy.frombuffer(...)
-  │                                  │  ↓
-  │                                  │  mimi.encode() (80ms frames)
-  │                                  │  ↓
-  │                                  │  lm_gen.step() (streaming LM)
-  │                                  │  ↓
-  │  ◄────{"type":"token"}────────   │
-  │  ◄────{"type":"token"}────────   │
-  │  ◄────{"type":"vad_end"}──────   │
+Client                    Python Proxy (Modal)           Rust moshi-server
+  │                              │                              │
+  │  ──Raw PCM float32───────►   │                              │
+  │                              │  ──msgpack {Audio,pcm}────►  │
+  │                              │                              │  mimi.encode()
+  │                              │                              │  lm_gen.step()
+  │                              │  ◄──msgpack {Word,text}────  │
+  │  ◄────{"type":"token"}────   │                              │
+  │  ◄────{"type":"token"}────   │                              │
 ```
 
 ### Key Components
 
 #### Modal App (`modal_app.py`)
 
-The main deployment uses:
+The deployment uses a Python proxy that forwards to an internal Rust moshi-server:
 - `@app.cls()` for GPU class with lifecycle management
-- `@modal.enter()` for model loading on container startup
-- `@modal.asgi_app()` for WebSocket endpoint
-- `@modal.concurrent()` for handling multiple sessions per container
+- `@modal.enter()` starts the Rust server on container startup
+- `@modal.asgi_app()` for WebSocket endpoint (Python proxy)
+- `@modal.concurrent(max_inputs=BATCH_SIZE)` for multiple sessions per container (default 8)
+
+The Rust server (moshi-server) handles batched inference, enabling multiple concurrent sessions per container.
 
 #### Moshi Streaming
 
 Unlike batch-based transformers, moshi processes audio frame-by-frame:
 
-```python
-# Enable streaming mode
-self.mimi.streaming_forever(batch_size=1)
-self.lm_gen.streaming_forever(batch_size=1)
-
-# Process each 80ms frame
-codes = self.mimi.encode(audio_frame)  # Neural codec
-tokens = self.lm_gen.step(codes)        # LM inference
+```
+Audio (24kHz) → Mimi Encoder (80ms frames) → LM (streaming) → Tokens
 ```
 
 This gives ~0.5s first-token latency vs ~5s for batch processing.
@@ -183,25 +176,20 @@ Request arrives
      │
      ▼
 ┌─────────────────┐
-│ Cold Start      │  ~20-30s (model loading)
+│ Cold Start      │  ~60-90s (Rust server + model loading)
 │ @modal.enter()  │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ Warm Container  │  Handles WebSocket sessions
-│ Multiple        │  Up to MAX_CONCURRENT_SESSIONS
-│ concurrent      │
+│ Warm Container  │  Handles up to BATCH_SIZE concurrent
+│ (Rust server    │  WebSocket sessions (default 8)
+│ with batching)  │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ Idle Timeout    │  10s no audio → close connection
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Scale Down      │  60s no connections → container stops
+│ Scale Down      │  120s no connections → container stops
 └─────────────────┘
 ```
 
@@ -209,38 +197,25 @@ Request arrives
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `IDLE_AUDIO_TIMEOUT_SECONDS` | 10s | Close WebSocket after silence |
-| `PING_INTERVAL_SECONDS` | 10s | Detect dead connections |
-| `MAX_SESSION_SECONDS` | 3600s | Maximum session duration |
-| `scaledown_window` | 60s | Container idle before shutdown |
+| `BATCH_SIZE` | 8 | Max concurrent sessions per container |
+| `RUST_SERVER_PORT` | 8998 | Internal port for Rust moshi-server |
+| `scaledown_window` | 120s | Container idle before shutdown |
 
 ### Performance Tuning
 
-GPU-specific optimizations are auto-detected based on compute capability:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `LM_TEMP` | 0 | LM temperature (0 = greedy decoding, fastest) |
-| `LM_TEMP_TEXT` | 0 | Text token temperature |
-| `TORCH_COMPILE` | 0 | torch.compile for mimi encoder (adds ~60s cold start) |
-| TF32 precision | enabled | Tensor core acceleration (Ampere+ GPUs) |
+The Rust moshi-server is compiled with CUDA support. The image compilation step must run on the same GPU type as the runtime to avoid CUDA symbol errors.
 
 **GPU Compatibility:**
 
-| GPU | Arch | Compute | TF32 |
-|-----|------|---------|------|
-| T4 | Turing | 7.5 | ❌ ignored |
-| L4 | Ada | 8.9 | ✅ |
-| A10G | Ampere | 8.6 | ✅ |
-| A100 | Ampere | 8.0 | ✅ |
-| H100 | Hopper | 9.0 | ✅ |
+| GPU | Arch | Recommended |
+|-----|------|-------------|
+| L4 | Ada | ✅ Good balance of cost/performance |
+| A10G | Ampere | ✅ |
+| L40S | Ada | ✅ Default - high throughput |
+| A100 | Ampere | ✅ Best performance |
+| H100 | Hopper | ✅ Best performance |
 
-**Note**: Greedy decoding (`temp=0`) is optimal for STT - it's both faster and more deterministic. Temperature > 0 adds randomness, which is useful for creative generation tasks but not transcription.
-
-To enable torch.compile (improves throughput but adds ~60s cold start):
-```bash
-TORCH_COMPILE=1 uvx modal deploy src/stt/modal_app.py
-```
+**Note**: T4 GPUs are not recommended - the Rust server compilation requires more recent CUDA features.
 
 ## Scripts
 
@@ -262,14 +237,11 @@ Benchmark latency with various options:
 # Sequential tests
 uv run scripts/latency_test.py -n 5
 
-# Parallel streams
+# Parallel streams (tests container scaling)
 uv run scripts/latency_test.py -p 4
 
 # Compare GPUs (deploys each to separate app)
 uv run scripts/latency_test.py --compare-gpus "T4,L4,A10G" -p 4
-
-# Skip warmup
-uv run scripts/latency_test.py -p 4 --no-warmup
 ```
 
 ### `prepare_samples.py`
@@ -292,7 +264,6 @@ uvx modal deploy src/stt/modal_app.py
 
 ```bash
 KYUTAI_GPU=A10G \
-MAX_CONCURRENT_SESSIONS=8 \
 KYUTAI_APP_NAME=my-stt-service \
 uvx modal deploy src/stt/modal_app.py
 ```
@@ -321,26 +292,26 @@ uvx modal app stop kyutai-stt
 
 ## Troubleshooting
 
+### CUDA Symbol Errors
+
+If you see `CUDA_ERROR_NOT_FOUND "named symbol not found"`:
+- The Rust server was compiled on a different GPU architecture than runtime
+- Ensure `gpu=KYUTAI_GPU` is set in the image compilation step
+- Redeploy with the correct GPU type
+
 ### Container Not Scaling Down
 
 If containers stay alive longer than expected:
 
 1. Check for zombie WebSocket connections
-2. Verify `IDLE_AUDIO_TIMEOUT_SECONDS` is set correctly
-3. Run the idle timeout test to verify behavior:
-   ```bash
-   uv run pytest tests/integration/test_idle_timeout.py -v -s
-   ```
-
-### Memory Issues
-
-The moshi streaming state doesn't survive memory snapshots, so `enable_memory_snapshot=False` is required. Cold starts take ~20-30s as a result.
+2. Check Modal dashboard for connection status
+3. Containers scale down after 120s of no connections
 
 ### Audio Payload Issues
 
 The server expects raw PCM float32 (little-endian) audio at 24kHz mono. If transcripts are empty:
 - Confirm you're sending float32 samples (not int16) at 24kHz
-- Send in ~80ms chunks to avoid idle timeouts
+- Send in ~80ms chunks (1920 samples per frame)
 
 ## Contributing
 

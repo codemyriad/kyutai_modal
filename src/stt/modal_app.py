@@ -1,237 +1,246 @@
-"""Modal deployment for Kyutai STT with low-latency streaming.
+"""Modal deployment for Kyutai STT using the Rust moshi-server.
+
+This uses the production Rust server which can handle 64+ concurrent sessions
+per container. A Python proxy accepts PCM audio from clients and forwards
+it to the internal Rust server via msgpack.
+
+Architecture:
+  Client --[PCM]--> Python proxy --[msgpack]--> Rust moshi-server
+                                            <--[Text]--
 
 Deploy with: uvx modal deploy src/stt/modal_app.py
 Dev server: uvx modal serve src/stt/modal_app.py
-
-This implementation uses moshi's streaming architecture for ~0.5s first-token latency
-instead of the batch-based transformers approach (~5s latency).
-
-Authentication:
-  The endpoint requires proxy auth tokens. Create tokens in Modal workspace settings.
-  Clients must pass Modal-Key and Modal-Secret headers (or query params for WebSocket).
 """
 
 import asyncio
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import modal
 
-# Model choice: 1B model for low latency (0.5s first-token vs 2.5s for 2.6B)
+# Configuration
 MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
-KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
-APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")  # Allows deploying multiple GPU variants
-# Only 1 session per container - model streaming state can't be shared
-# Modal scales containers for concurrency
-MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "1"))
-IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "10.0"))  # Close idle connections quickly
-MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
-PING_INTERVAL_SECONDS = float(os.getenv("PING_INTERVAL_SECONDS", "10.0"))  # Detect dead connections
-# LM generation parameters (temp=0 = greedy decoding, fastest and deterministic)
-LM_TEMP = float(os.getenv("LM_TEMP", "0"))
-LM_TEMP_TEXT = float(os.getenv("LM_TEMP_TEXT", "0"))
+KYUTAI_GPU = os.getenv("KYUTAI_GPU", "L40S")  # L40S recommended for Rust server
+APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))  # 8 for testing, 64 for L40S production
+RUST_SERVER_PORT = 8998  # Internal port for Rust server
 
-# Build image with moshi stack
+MINUTES = 60
+
+# Use CUDA 12.1 to avoid compatibility issues with newer versions
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.1.0-devel-ubuntu22.04",
+        add_python="3.11",
+    )
+    .apt_install(
+        "curl",
+        "build-essential",
+        "pkg-config",
+        "libssl-dev",
+        "git",
+        "cmake",
+        "libopus-dev",
+        "python3.11-dev",
+        "libpython3.11-dev",
+    )
+    # Install Rust toolchain
+    .run_commands(
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+    )
+    # Install moshi-server with CUDA support
+    # Must compile on same GPU type as runtime to avoid CUDA symbol errors
+    .run_commands(
+        "export PATH=$HOME/.cargo/bin:$PATH && "
+        "cargo install --features cuda moshi-server",
+        gpu=KYUTAI_GPU,  # Compile on same GPU type as runtime
+    )
     .pip_install(
-        "moshi==0.2.9",
-        "torch==2.4.0",
-        "numpy<2",
+        "huggingface-hub[hf_transfer]>=0.25.0",
         "fastapi>=0.115.0",
         "websockets>=13.0",
-        "huggingface-hub[hf_transfer]>=0.25.0",
+        "numpy<2",
+        "opuslib",  # Python bindings for Opus codec
+        "msgpack",  # For parsing Rust server responses
     )
-    .env(
-        {
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        }
-    )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
 # Volume for caching model weights
 hf_cache_vol = modal.Volume.from_name("kyutai-stt-hf-cache", create_if_missing=True)
 hf_cache_vol_path = Path("/root/.cache/huggingface")
-volumes = {hf_cache_vol_path: hf_cache_vol}
 
 app = modal.App(APP_NAME, image=image)
 
-MINUTES = 60
+
+def generate_config(model_name: str, batch_size: int, port: int) -> str:
+    """Generate moshi-server config TOML."""
+    if "2.6b" in model_name.lower():
+        candle_repo = "kyutai/stt-2.6b-en-candle"
+        asr_delay = 31
+        d_model, num_heads, num_layers, dim_feedforward = 2560, 20, 24, 10240
+    else:
+        candle_repo = "kyutai/stt-1b-en_fr-candle"
+        asr_delay = 6
+        d_model, num_heads, num_layers, dim_feedforward = 2048, 16, 16, 8192
+
+    return f'''static_dir = "/tmp/static/"
+log_dir = "/tmp/stt-logs"
+instance_name = "stt"
+authorized_ids = ["public_token"]
+
+[modules.asr]
+path = "/api/asr-streaming"
+type = "BatchedAsr"
+lm_model_file = "hf://{candle_repo}/model.safetensors"
+text_tokenizer_file = "hf://{candle_repo}/tokenizer_en_fr_audio_8000.model"
+audio_tokenizer_file = "hf://{candle_repo}/mimi-pytorch-e351c8d8@125.safetensors"
+asr_delay_in_tokens = {asr_delay}
+batch_size = {batch_size}
+conditioning_learnt_padding = true
+temperature = 0.0
+
+[modules.asr.model]
+audio_vocab_size = 2049
+text_in_vocab_size = 8001
+text_out_vocab_size = 8000
+audio_codebooks = 32
+
+[modules.asr.model.transformer]
+d_model = {d_model}
+num_heads = {num_heads}
+num_layers = {num_layers}
+dim_feedforward = {dim_feedforward}
+causal = true
+norm_first = true
+bias_ff = false
+bias_attn = false
+context = 750
+max_period = 100000
+use_conv_block = false
+use_conv_bias = true
+gating = "silu"
+norm = "RmsNorm"
+positional_embedding = "Rope"
+conv_layout = false
+conv_kernel_size = 3
+kv_repeat = 1
+max_seq_len = 40960
+
+[modules.asr.model.extra_heads]
+num_heads = 4
+dim = 6
+'''
 
 
 @app.cls(
     gpu=KYUTAI_GPU,
-    volumes=volumes,
-    timeout=10 * MINUTES,  # Max 10 min per request (prevents stuck connections)
-    scaledown_window=60,  # 1 minute idle before scale down
-    max_containers=4,  # Scale containers for concurrency (not sessions per container)
+    volumes={hf_cache_vol_path: hf_cache_vol},
+    timeout=30 * MINUTES,
+    scaledown_window=120,
+    max_containers=10,
     min_containers=0,
-    buffer_containers=0,  # No buffer containers
-    enable_memory_snapshot=False,  # Disabled: moshi streaming state doesn't survive snapshots
 )
-@modal.concurrent(max_inputs=MAX_CONCURRENT_SESSIONS)
+@modal.concurrent(max_inputs=BATCH_SIZE)
 class KyutaiSTTService:
-    """Real-time streaming Speech-to-Text service using Kyutai STT with moshi."""
-
-    BATCH_SIZE = 1
+    """Proxy service: accepts PCM, encodes to Opus, forwards to Rust server."""
 
     @modal.enter()
-    def load_model(self):
-        """Load model and warmup GPU on container startup."""
-        import torch
-        from huggingface_hub import snapshot_download
-        from moshi.models import LMGen, loaders
+    def start_rust_server(self):
+        """Start the Rust moshi-server on container startup."""
+        # Generate config
+        config_content = generate_config(MODEL_NAME, BATCH_SIZE, RUST_SERVER_PORT)
+        config_path = "/tmp/stt-config.toml"
+        with open(config_path, "w") as f:
+            f.write(config_content)
+        print(f"Config written to {config_path}")
 
-        print(f"Loading Kyutai STT model: {MODEL_NAME}")
-        start_time = time.monotonic_ns()
+        os.makedirs("/tmp/stt-logs", exist_ok=True)
+        os.makedirs("/tmp/static", exist_ok=True)
 
-        # Download model weights (cached in volume)
-        snapshot_download(MODEL_NAME)
+        # Start Rust server
+        cmd = [
+            "/root/.cargo/bin/moshi-server",
+            "worker",
+            "--config", config_path,
+            "--port", str(RUST_SERVER_PORT),
+        ]
+        print(f"Starting Rust server: {' '.join(cmd)}")
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {self.device}")
+        env = os.environ.copy()
+        env["RUST_LOG"] = "debug,moshi_server=trace,moshi=trace"
+        env["RUST_BACKTRACE"] = "1"
+        env["HF_HOME"] = str(hf_cache_vol_path)
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-        # Enable TF32 for Ampere+ GPUs (A100, A10G, L4, H100)
-        # Ignored on older GPUs (T4) - they'll use FP32 automatically
-        if self.device == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-        # Load model components directly to GPU
-        checkpoint_info = loaders.CheckpointInfo.from_hf_repo(MODEL_NAME)
-        self.mimi = checkpoint_info.get_mimi(device=self.device)
-        self.moshi = checkpoint_info.get_moshi(device=self.device)
-        self.text_tokenizer = checkpoint_info.get_text_tokenizer()
-
-        # torch.compile can improve throughput but adds ~60s to cold start
-        # Disabled by default; enable with TORCH_COMPILE=1 for high-throughput scenarios
-        use_compile = os.getenv("TORCH_COMPILE", "0") == "1"
-        if use_compile:
-            print("Compiling mimi encoder with torch.compile...")
-            self.mimi.encoder = torch.compile(self.mimi.encoder, mode="reduce-overhead")
-
-        # Create language model generator
-        # temp=0 means greedy decoding (fastest, deterministic)
-        # Higher temp (e.g., 0.8) adds randomness, useful for creative tasks
-        self.lm_gen = LMGen(self.moshi, temp=LM_TEMP, temp_text=LM_TEMP_TEXT)
-
-        # Model configuration
-        self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
-        print(
-            f"Mimi: sample_rate={self.mimi.sample_rate} "
-            f"frame_rate={self.mimi.frame_rate} frame_size={self.frame_size}"
+        # Write Rust server output to a log file we can read
+        self.rust_log_file = open("/tmp/rust-server.log", "w")
+        self.rust_process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=self.rust_log_file,
+            stderr=subprocess.STDOUT,
         )
 
-        # Enable streaming mode
-        self.mimi.streaming_forever(self.BATCH_SIZE)
-        self.lm_gen.streaming_forever(self.BATCH_SIZE)
+        # Wait for server to be fully ready (model loaded)
+        print("Waiting for Rust server to start and load model...")
+        start_time = time.monotonic()
+        log_content = ""
+        while time.monotonic() - start_time < 600:  # 10 min timeout for model loading
+            # Read stdout to check logs (non-blocking would be better but this works)
+            if self.rust_process.poll() is not None:
+                output = self.rust_process.stdout.read().decode() if self.rust_process.stdout else ""
+                raise RuntimeError(f"Rust server exited: {output[-3000:]}")
 
-        # Warmup CUDA kernels
-        print("Warming up GPU...")
-        for _ in range(4):
-            codes = self.mimi.encode(
-                torch.zeros(self.BATCH_SIZE, 1, self.frame_size).to(self.device)
-            )
-            for c in range(codes.shape[-1]):
-                tokens = self.lm_gen.step(codes[:, :, c : c + 1])
-                if tokens is None:
-                    continue
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        # Lock to serialize GPU inference (model is stateful, can't run concurrently)
-        self.inference_lock = asyncio.Lock()
-
-        elapsed = round((time.monotonic_ns() - start_time) / 1e9, 2)
-        print(f"Model loaded and warmed up in {elapsed}s")
-
-    def reset_state(self):
-        """Reset model state between sessions."""
-        self.mimi.reset_streaming()
-        self.lm_gen.reset_streaming()
-
-    async def transcribe_chunk(self, pcm, all_pcm_data):
-        """Process an audio chunk and yield transcription tokens.
-
-        Args:
-            pcm: New PCM audio data (numpy array, float32)
-            all_pcm_data: Accumulated PCM data from previous chunks
-
-        Yields:
-            - str: A transcription token (word fragment)
-            - dict: Control messages (e.g., {"type": "vad_end"})
-            - numpy.ndarray: Remaining PCM data (yielded last)
-        """
-        import numpy as np
-        import torch
-
-        if pcm is None or len(pcm) == 0:
-            yield all_pcm_data
-            return
-
-        if pcm.shape[-1] == 0:
-            yield all_pcm_data
-            return
-
-        if all_pcm_data is None:
-            all_pcm_data = pcm
+            # Try socket connection check first, then wait for model to warm up
+            import socket
+            try:
+                with socket.create_connection(("127.0.0.1", RUST_SERVER_PORT), timeout=1):
+                    # Socket is open - server is listening
+                    elapsed = time.monotonic() - start_time
+                    if elapsed < 30:
+                        # Wait a bit more for model to load (socket opens before model loads)
+                        print(f"[{elapsed:.1f}s] Server listening, waiting for model warmup...")
+                        time.sleep(5)
+                    else:
+                        print(f"Rust server ready after {elapsed:.1f}s")
+                        break
+            except (ConnectionRefusedError, socket.timeout, OSError) as e:
+                elapsed = time.monotonic() - start_time
+                if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                    print(f"[{elapsed:.0f}s] Still waiting for Rust server... ({e})")
+                time.sleep(1)
         else:
-            all_pcm_data = np.concatenate((all_pcm_data, pcm))
+            raise RuntimeError("Rust server failed to start within 10 minutes")
 
-        # Process each complete frame (80ms at 24kHz = 1920 samples)
-        while all_pcm_data.shape[-1] >= self.frame_size:
-            chunk = all_pcm_data[: self.frame_size]
-            all_pcm_data = all_pcm_data[self.frame_size :]
+        # Store internal WebSocket URL
+        self.rust_ws_url = f"ws://127.0.0.1:{RUST_SERVER_PORT}/api/asr-streaming"
+        print(f"Rust server URL: {self.rust_ws_url}")
 
-            with torch.no_grad():
-                chunk = torch.from_numpy(chunk)
-                chunk = chunk.unsqueeze(0).unsqueeze(0)  # (1, 1, frame_size)
-                chunk = chunk.expand(self.BATCH_SIZE, -1, -1)
-                chunk = chunk.to(device=self.device)
-
-                # Encode audio with mimi
-                codes = self.mimi.encode(chunk)
-
-                # Run language model inference
-                for c in range(codes.shape[-1]):
-                    text_tokens, vad_heads = self.lm_gen.step_with_extra_heads(
-                        codes[:, :, c : c + 1]
-                    )
-                    if text_tokens is None:
-                        yield all_pcm_data
-                        return
-
-                    # Check voice activity detection
-                    if vad_heads:
-                        pr_vad = vad_heads[2][0, 0, 0].cpu().item()
-                        if pr_vad > 0.5:
-                            # End of speech detected
-                            yield {"type": "vad_end"}
-                            yield all_pcm_data
-                            return
-
-                    text_token = text_tokens[0, 0, 0].item()
-                    # Token 0 and 3 are special tokens (padding/silence)
-                    if text_token not in (0, 3):
-                        text = self.text_tokenizer.id_to_piece(text_token)
-                        text = text.replace("\u2581", " ")  # Sentencepiece space marker
-                        yield text
-
-        yield all_pcm_data
+    @modal.exit()
+    def stop_rust_server(self):
+        """Stop the Rust server on container shutdown."""
+        if hasattr(self, "rust_process") and self.rust_process:
+            self.rust_process.terminate()
+            try:
+                self.rust_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.rust_process.kill()
 
     @modal.asgi_app(requires_proxy_auth=True)
     def serve(self):
-        """Create and return the ASGI app."""
+        """Create the ASGI app that proxies to Rust server."""
         import json
-        import traceback
 
+        import msgpack
         import numpy as np
+        import websockets
         from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-        web_app = FastAPI(title="Kyutai STT Streaming API")
+        web_app = FastAPI(title="Kyutai STT (Rust Backend)")
 
         @web_app.get("/health")
         def health():
@@ -239,15 +248,14 @@ class KyutaiSTTService:
                 "status": "ok",
                 "model": MODEL_NAME,
                 "gpu": KYUTAI_GPU,
-                "sample_rate": int(self.mimi.sample_rate),
-                "frame_rate": int(self.mimi.frame_rate),
-                "frame_size": self.frame_size,
+                "backend": "rust",
+                "batch_size": BATCH_SIZE,
             }
 
         @web_app.get("/")
-        async def root():
+        def root():
             return {
-                "service": "Kyutai STT (Streaming)",
+                "service": "Kyutai STT (Rust Backend)",
                 "model": MODEL_NAME,
                 "status": "ready",
                 "endpoints": {
@@ -258,136 +266,167 @@ class KyutaiSTTService:
 
         @web_app.websocket("/v1/stream")
         async def transcribe_websocket(ws: WebSocket):
-            """WebSocket endpoint for streaming audio transcription.
-
-            Protocol:
-            - Client sends: Raw PCM float32 LE audio bytes (24kHz mono)
-            - Server sends: JSON messages with transcription updates
-              - {"type": "token", "text": "word"} - New token
-              - {"type": "vad_end"} - Voice activity ended
-              - {"type": "ping"} - Keepalive (client should ignore)
-              - {"type": "error", "message": "..."} - Error occurred
-            """
+            """WebSocket endpoint - accepts PCM, proxies to Rust server."""
             await ws.accept()
-            print("Session started")
+            print("Client session started")
 
-            session_start = time.monotonic()
+            # Rust server expects 1920 samples per frame (80ms at 24kHz)
+            SAMPLE_RATE = 24000
+            FRAME_SIZE = 1920  # 80ms frames
+
+            pcm_buffer = np.array([], dtype=np.float32)
             bytes_in = 0
             tokens_sent = 0
-            all_pcm_data = None
-            capture_bytes = bytearray()
-            recv_debug_logged = 0
-            connection_dead = asyncio.Event()
 
             async def send_json(payload: dict) -> bool:
                 try:
                     await asyncio.wait_for(ws.send_text(json.dumps(payload)), timeout=5.0)
                     return True
                 except Exception:
-                    connection_dead.set()
                     return False
 
-            async def ping_task():
-                """Send periodic pings to detect dead connections."""
-                while not connection_dead.is_set():
-                    await asyncio.sleep(PING_INTERVAL_SECONDS)
-                    if connection_dead.is_set():
-                        break
-                    ok = await send_json({"type": "ping"})
-                    if not ok:
-                        print("[ws] ping failed - connection dead")
-                        break
-
-            ping_handle = asyncio.create_task(ping_task())
-
             try:
-                while not connection_dead.is_set():
-                    # Enforce max session duration
-                    if time.monotonic() - session_start > MAX_SESSION_SECONDS:
-                        print(f"[ws] max session duration reached ({MAX_SESSION_SECONDS}s)")
-                        break
+                # Connect to Rust server
+                rust_headers = {"kyutai-api-key": "public_token"}
+                print(f"Connecting to Rust server at {self.rust_ws_url}...")
+                async with websockets.connect(
+                    self.rust_ws_url,
+                    additional_headers=rust_headers,
+                    open_timeout=30,
+                ) as rust_ws:
+                    print(f"Connected to Rust backend: {rust_ws.state}")
 
-                    try:
-                        data = await asyncio.wait_for(
-                            ws.receive_bytes(), timeout=IDLE_AUDIO_TIMEOUT_SECONDS
-                        )
-                    except asyncio.TimeoutError:
-                        print("[ws] receive timeout")
-                        break
-                    except WebSocketDisconnect:
-                        print("[ws] client disconnect")
-                        break
-                    except Exception as e:
-                        print(f"[ws] receive error: {e}")
-                        traceback.print_exc()
-                        break
+                    async def receive_from_rust():
+                        """Receive transcriptions from Rust server and forward to client."""
+                        nonlocal tokens_sent
+                        msg_count = 0
+                        while True:
+                            try:
+                                msg = await rust_ws.recv()
+                                msg_count += 1
+                                if isinstance(msg, bytes):
+                                    # Rust server sends msgpack-encoded messages
+                                    try:
+                                        data = msgpack.unpackb(msg, raw=False)
+                                        if msg_count <= 10:
+                                            print(f"Rust msg {msg_count}: {data}")
 
-                    if not data:
-                        continue
+                                        # Handle different message types
+                                        if isinstance(data, dict):
+                                            msg_type = data.get("type") or data.get("Word") or list(data.keys())[0] if data else None
 
-                    bytes_in += len(data)
-                    capture_bytes.extend(data)
-                    if recv_debug_logged < 3:
-                        recv_debug_logged += 1
-                        print(f"[ws] received chunk len={len(data)} total={bytes_in}")
-
-                    # Convert any complete float32 samples to PCM
-                    usable_len = len(capture_bytes) // 4 * 4  # 4 bytes per float32 sample
-                    if usable_len == 0:
-                        continue
-
-                    pcm_out = np.frombuffer(memoryview(capture_bytes)[:usable_len], dtype=np.float32).copy()
-                    del capture_bytes[:usable_len]
-
-                    if pcm_out.size == 0:
-                        continue
-
-                    new_pcm = pcm_out
-
-                    # Process audio and yield tokens (serialized via lock)
-                    try:
-                        async with self.inference_lock:
-                            async for msg in self.transcribe_chunk(new_pcm, all_pcm_data):
-                                if isinstance(msg, str):
-                                    ok = await send_json({"type": "token", "text": msg})
-                                    if not ok:
-                                        print(f"[ws] send failed for token: {msg}")
-                                        raise RuntimeError("send failed")
-                                    tokens_sent += 1
-                                    if tokens_sent <= 5:
-                                        print(f"[ws] sent token {tokens_sent}: {msg}")
-                                elif isinstance(msg, dict):
-                                    ok = await send_json(msg)
-                                    if not ok:
-                                        print(f"[ws] send failed for msg: {msg}")
-                                        raise RuntimeError("send failed")
+                                            # Word message contains transcription
+                                            if "Word" in data or msg_type == "Word":
+                                                word_data = data.get("Word", data)
+                                                text = word_data.get("text", "")
+                                                if text:
+                                                    await send_json({"type": "token", "text": text})
+                                                    tokens_sent += 1
+                                                    if tokens_sent <= 5:
+                                                        print(f"Token {tokens_sent}: {text}")
+                                            elif "Step" in data:
+                                                # Step message - ignore (timing info)
+                                                pass
+                                            elif "Marker" in data:
+                                                # End marker
+                                                print(f"Received end marker: {data}")
+                                    except msgpack.UnpackException as e:
+                                        if msg_count <= 10:
+                                            print(f"Rust msg {msg_count}: {len(msg)} bytes (not msgpack: {e})")
                                 else:
-                                    all_pcm_data = msg
-                    except Exception as e:
-                        print(f"[ws] inference/send error: {e}")
-                        traceback.print_exc()
-                        continue
+                                    print(f"Rust string msg: {repr(msg[:100] if len(msg) > 100 else msg)}")
+                            except websockets.exceptions.ConnectionClosed as e:
+                                print(f"Rust connection closed: {e}")
+                                break
+                            except Exception as e:
+                                print(f"Rust recv error: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                break
+                        print(f"Rust receiver done: {msg_count} messages, {tokens_sent} tokens")
+
+                    # Start receiving from Rust in background
+                    print("Starting receive task...")
+                    recv_task = asyncio.create_task(receive_from_rust())
+                    print(f"Receive task started: {recv_task}")
+
+                    try:
+                        while True:
+                            try:
+                                data = await asyncio.wait_for(ws.receive_bytes(), timeout=30.0)
+                            except asyncio.TimeoutError:
+                                print("Client timeout")
+                                break
+                            except WebSocketDisconnect:
+                                print("Client disconnected")
+                                break
+
+                            if not data:
+                                continue
+
+                            bytes_in += len(data)
+                            frames_sent = 0
+
+                            # Convert bytes to float32 PCM
+                            pcm = np.frombuffer(data, dtype=np.float32)
+                            pcm_buffer = np.concatenate([pcm_buffer, pcm])
+
+                            # Send complete frames as msgpack to Rust server
+                            while len(pcm_buffer) >= FRAME_SIZE:
+                                frame = pcm_buffer[:FRAME_SIZE]
+                                pcm_buffer = pcm_buffer[FRAME_SIZE:]
+
+                                # Send as msgpack: {"type": "Audio", "pcm": [floats]}
+                                msg = {"type": "Audio", "pcm": frame.tolist()}
+                                data_out = msgpack.packb(msg)
+                                await rust_ws.send(data_out)
+                                frames_sent += 1
+
+                            if bytes_in <= 80000:  # Log first ~80KB
+                                print(f"Received {len(data)} bytes, sent {frames_sent} PCM frames, total={bytes_in}")
+
+                            # Check Rust server log after first chunk
+                            if bytes_in == len(data):
+                                try:
+                                    self.rust_log_file.flush()
+                                    with open("/tmp/rust-server.log", "r") as f:
+                                        content = f.read()
+                                        print(f"[Rust log: {len(content)} chars]")
+                                        if content:
+                                            # Show first 2000 chars to see errors
+                                            print("=== RUST LOG START ===")
+                                            print(content[:2000])
+                                            print("=== RUST LOG END ===")
+                                except Exception as e:
+                                    print(f"Log read error: {e}")
+
+                    finally:
+                        print(f"Cleaning up, recv_task done={recv_task.done()}")
+                        recv_task.cancel()
+                        try:
+                            await recv_task
+                        except asyncio.CancelledError:
+                            print("Receive task cancelled")
 
             except Exception as e:
-                print(f"[ws] session error: {e}")
+                print(f"Session error: {e}")
+                import traceback
                 traceback.print_exc()
             finally:
-                # Stop ping task
-                connection_dead.set()
-                ping_handle.cancel()
+                print(f"Session ended: {bytes_in} bytes in, {tokens_sent} tokens out")
+                # Print last bit of Rust server log for debugging
                 try:
-                    await ping_handle
-                except asyncio.CancelledError:
-                    pass
-
-                print(
-                    f"[session] bytes_in={bytes_in} tokens={tokens_sent}"
-                )
-                self.reset_state()
+                    self.rust_log_file.flush()
+                    with open("/tmp/rust-server.log", "r") as f:
+                        content = f.read()
+                        if content:
+                            print(f"Rust server log ({len(content)} chars):")
+                            print(content[-2000:] if len(content) > 2000 else content)
+                except Exception as e:
+                    print(f"Could not read Rust log: {e}")
                 try:
                     await ws.close()
                 except Exception:
                     pass
-                print("Session ended")
 
         return web_app

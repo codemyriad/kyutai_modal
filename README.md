@@ -147,31 +147,30 @@ uv run scripts/latency_test.py -p 4
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KYUTAI_GPU` | `A100` | GPU type (`T4`, `L4`, `A10G`, `A100`, `H100`) |
-| `MAX_CONCURRENT_SESSIONS` | `4` | Max WebSocket sessions per container |
-| `IDLE_AUDIO_TIMEOUT_SECONDS` | `10` | Close connection after this many seconds without audio |
-| `MAX_SESSION_SECONDS` | `3600` | Maximum session duration (1 hour) |
+| `KYUTAI_GPU` | `L40S` | GPU type (`L4`, `A10G`, `L40S`, `A100`, `H100`) |
+| `BATCH_SIZE` | `8` | Max concurrent sessions per container |
+| `MODEL_NAME` | `kyutai/stt-1b-en_fr` | Model to use (1B or 2.6B) |
 
 Example:
 
 ```bash
-KYUTAI_GPU=L4 MAX_CONCURRENT_SESSIONS=8 uvx modal deploy src/stt/modal_app.py
+KYUTAI_GPU=L4 uvx modal deploy src/stt/modal_app.py
 ```
 
 ## GPU Selection & Pricing
 
 Modal bills per-second. Choose based on your latency and cost requirements:
 
-| GPU | VRAM | Cost/Hour | First Token (1 stream) | First Token (4 streams) | Max Concurrent |
-|-----|------|-----------|------------------------|------------------------|----------------|
-| **T4** | 16GB | $0.59 | ~0.7s | ~1.4s | 2-4 |
-| **L4** | 24GB | $0.80 | ~0.6s | ~1.1s | 4-8 |
-| **A10G** | 24GB | $1.10 | ~0.5s | ~1.0s | 4-8 |
-| **A100** | 80GB | $2.78 | ~0.5s | ~0.9s | 16+ |
+| GPU | VRAM | Cost/Hour | First Token Latency |
+|-----|------|-----------|---------------------|
+| **T4** | 16GB | $0.59 | ~0.7s |
+| **L4** | 24GB | $0.80 | ~0.6s |
+| **A10G** | 24GB | $1.10 | ~0.5s |
+| **A100** | 80GB | $2.78 | ~0.5s |
 
-**Benchmarks**: First token latency measured with 8 seconds of audio, 4 parallel streams on warm container.
+**Benchmarks**: First token latency measured with 8 seconds of audio on warm container.
 
-**Concurrent sessions**: Set via `MAX_CONCURRENT_SESSIONS` (default: 4). Higher values increase throughput but add latency per stream. The limits above are conservative estimates based on VRAM.
+**Scaling**: Each container handles up to 8 concurrent sessions (configurable via `BATCH_SIZE`). Modal automatically scales containers to handle more concurrent users (up to 10 containers by default).
 
 ### Benchmark Different GPUs
 
@@ -189,12 +188,13 @@ uvx modal app stop kyutai-stt-a100
 ## How It Works
 
 1. **Audio Capture**: Client captures microphone audio at 24kHz mono and streams raw PCM float32
-2. **WebSocket Streaming**: PCM chunks (~80ms) are streamed to the server over WebSocket
-3. **Neural Codec**: Server encodes audio with Mimi neural codec (80ms frames)
-4. **Language Model**: Each frame is processed by the streaming transformer for immediate token output
-5. **Token Streaming**: Tokens are sent back immediately as they're generated (~0.5s latency)
+2. **WebSocket Streaming**: PCM chunks (~80ms) are streamed to the Python proxy over WebSocket
+3. **Rust Server**: A Python proxy forwards audio to the internal Rust moshi-server (supports batched inference)
+4. **Neural Codec**: Audio is encoded with Mimi neural codec (80ms frames)
+5. **Language Model**: Each frame is processed by the streaming transformer for immediate token output
+6. **Token Streaming**: Tokens are sent back immediately as they're generated (~0.5s latency)
 
-The key to low latency is the **moshi streaming architecture** - instead of waiting for complete utterances, the model processes audio frame-by-frame and outputs tokens incrementally.
+The key to low latency is the **moshi streaming architecture** - instead of waiting for complete utterances, the model processes audio frame-by-frame and outputs tokens incrementally. The Rust server enables efficient batched processing of multiple concurrent streams.
 
 ## Cost Optimization
 
