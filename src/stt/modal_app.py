@@ -322,10 +322,14 @@ class KyutaiSTTRustService:
                                                 if text:
                                                     # Convert sentencepiece space marker to regular space
                                                     text = text.replace("\u2581", " ")
+                                                    # Add leading space if token starts with a letter
+                                                    # and doesn't already have a leading space
+                                                    if text and text[0].isalpha():
+                                                        text = " " + text
                                                     await send_json({"type": "token", "text": text})
                                                     tokens_sent += 1
                                                     if tokens_sent <= 5:
-                                                        print(f"Token {tokens_sent}: {text}")
+                                                        print(f"Token {tokens_sent}: {repr(text)}")
                                             elif "Step" in data:
                                                 # Step message - ignore (timing info)
                                                 pass
