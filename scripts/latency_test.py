@@ -187,12 +187,14 @@ async def measure_latency(
     live: "Live | None" = None,
     render_fn: "callable | None" = None,
     state: dict | None = None,
+    quiet: bool = False,
 ):
     """Send audio in streaming chunks and measure token latencies.
 
     If `live` and `render_fn` are provided, uses an external Rich Live display
     instead of creating its own (for persistent TUI across multiple tests).
     If `state` is provided, updates it in place (for external state tracking).
+    If `quiet` is True, disables all TUI and output (for parallel mode).
     """
     import soundfile as sf
 
@@ -237,7 +239,7 @@ async def measure_latency(
             playback_buffer = None
 
     audio_seconds = len(audio) / sr
-    if not RICH_AVAILABLE:
+    if not RICH_AVAILABLE and not quiet:
         print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
         print(f"Connecting to {uri}...")
 
@@ -311,7 +313,7 @@ async def measure_latency(
     render = render_fn if render_fn else render_dashboard
 
     # Start Live display BEFORE connecting so we can show connection progress
-    if RICH_AVAILABLE and not external_live:
+    if RICH_AVAILABLE and not external_live and not quiet:
         live = Live(render(), console=console, refresh_per_second=12, screen=True)
         live.start()
 
@@ -348,13 +350,13 @@ async def measure_latency(
                 with contextlib.suppress(asyncio.CancelledError):
                     await update_task
 
-            if not RICH_AVAILABLE:
+            if not RICH_AVAILABLE and not quiet:
                 print(f"Connected in {connect_time:.2f}s")
 
             if live:
                 live.update(render())
 
-            if not RICH_AVAILABLE:
+            if not RICH_AVAILABLE and not quiet:
                 print(f"Streaming audio at {real_time_factor}x realtime...")
             start_time = time.perf_counter()
 
@@ -460,8 +462,8 @@ async def measure_latency(
             playback_stream.stop()
             playback_stream.close()
 
-    # Only print summary if not using external TUI (it will show results differently)
-    if not external_live:
+    # Only print summary if not using external TUI and not quiet
+    if not external_live and not quiet:
         print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
         print(f"\nTotal round-trip: {total_time:.3f}s")
         print(f"  Connect: {connect_time:.2f}s")
@@ -656,6 +658,7 @@ async def run_parallel_test(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
+    no_tui: bool = False,
 ):
     """Run multiple streams in parallel to test concurrent handling."""
 
@@ -667,117 +670,26 @@ async def run_parallel_test(
         else:
             print("failed (continuing anyway)\n")
 
-    if not RICH_AVAILABLE:
-        # Fallback: run without TUI
-        print(f"Running {num_streams} parallel streams...")
+    # Simple parallel test without TUI (TUI doesn't work well with parallel streams)
+    print(f"Running {num_streams} parallel streams...")
 
-        async def labeled_test(idx: int):
-            result = await measure_latency(
-                uri,
-                wav_path=wav_path,
-                auth_headers=auth_headers,
-                real_time_factor=real_time_factor,
-                expected_text=expected_text,
-                stop_event=stop_event,
-                playback=playback,
-                playback_device=playback_device,
-            )
-            return idx, result
+    async def labeled_test(idx: int):
+        # Run in quiet mode - no TUI, no output
+        result = await measure_latency(
+            uri,
+            wav_path=wav_path,
+            auth_headers=auth_headers,
+            real_time_factor=real_time_factor,
+            expected_text=None,  # Skip text comparison for parallel
+            stop_event=stop_event,
+            playback=False,  # No playback in parallel mode
+            playback_device=None,
+            quiet=True,  # Suppress all output
+        )
+        return idx, result
 
-        tasks = [labeled_test(i) for i in range(num_streams)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    else:
-        # TUI mode: show all parallel streams
-        console = Console()
-        bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
-
-        # Create a state dict for each stream
-        states = [{} for _ in range(num_streams)]
-
-        def render_stream_panel(idx: int, state: dict) -> Panel:
-            """Render a single stream's panel."""
-            def fmt(v):
-                return f"[cyan]{v:.2f}s[/cyan]" if v is not None else "[dim]--[/dim]"
-
-            status = state.get("status", "pending")
-            if status == "connecting" and state.get("connect_start"):
-                elapsed = time.perf_counter() - state["connect_start"]
-                status = f"[yellow]connecting ({elapsed:.1f}s)[/yellow]"
-            elif status == "streaming":
-                status = f"[cyan]{status}[/cyan]"
-            elif status == "complete":
-                status = f"[green]{status}[/green]"
-            elif status.startswith("error"):
-                status = f"[red]{status}[/red]"
-            else:
-                status = f"[dim]{status}[/dim]"
-
-            pct = state["sent_bytes"] / state["total_bytes"] if state.get("total_bytes") else 0.0
-            bar_len = 20
-            filled = int(bar_len * pct)
-            bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim]"
-
-            lines = []
-            lines.append(f"[dim]{state.get('audio_len', 0):.1f}s @ {state.get('rtf', 1.0)}x[/dim]  {status}  [dim]connect:[/dim]{fmt(state.get('connect_time'))}  [dim]first:[/dim]{fmt(state.get('first_token'))}")
-            lines.append(f"{bar} {pct*100:5.1f}%")
-
-            if state.get("expected_text"):
-                expected = state["expected_text"]
-                actual = state.get("recognized_text", "")
-                lines.append(f"[blue]expect:[/blue] {expected}")
-                lines.append(f"[blue]actual:[/blue] {_color_diff(expected, actual)}")
-
-            bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
-            content = "\n".join(lines)
-            return Panel(content, title=f"[magenta]{bear} Stream {idx+1}[/magenta]", border_style="magenta", padding=(0, 1))
-
-        def render_all():
-            """Render all stream panels stacked vertically."""
-            panels = [render_stream_panel(i, states[i]) for i in range(num_streams)]
-            return Group(*panels)
-
-        live = Live(render_all(), console=console, refresh_per_second=12, screen=True)
-        live.start()
-
-        # Background task to keep display updated
-        update_running = True
-
-        async def update_display():
-            while update_running:
-                live.update(render_all())
-                await asyncio.sleep(0.1)
-
-        update_task = asyncio.create_task(update_display())
-
-        async def labeled_test(idx: int):
-            # Create a render function that updates just this stream's panel but refreshes all
-            def stream_render():
-                return render_all()
-
-            result = await measure_latency(
-                uri,
-                wav_path=wav_path,
-                auth_headers=auth_headers,
-                real_time_factor=real_time_factor,
-                expected_text=expected_text,
-                stop_event=stop_event,
-                playback=playback if idx == 0 else False,  # Only first stream plays audio
-                playback_device=playback_device,
-                live=live,
-                render_fn=stream_render,
-                state=states[idx],
-            )
-            return idx, result
-
-        tasks = [labeled_test(i) for i in range(num_streams)]
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            update_running = False
-            update_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await update_task
-            live.stop()
+    tasks = [labeled_test(i) for i in range(num_streams)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     print(f"\n{'='*50}")
     print("Parallel Test Summary")
@@ -786,7 +698,7 @@ async def run_parallel_test(
     successful = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"  Stream {i+1}: FAILED - {result}")
+            print(f"  Stream {i+1}: FAILED - {type(result).__name__}: {result}")
         else:
             idx, metrics = result
             if metrics.get("first_token_time"):
@@ -799,7 +711,11 @@ async def run_parallel_test(
                     f"tokens={metrics['token_count']}"
                 )
             else:
-                print(f"  Stream {i+1}: No tokens received")
+                # Show diagnostic info
+                connect = metrics.get("connect_time")
+                send = metrics.get("send_time")
+                total = metrics.get("total_time")
+                print(f"  Stream {i+1}: No tokens received (connect={connect:.2f}s, send={send:.2f}s, total={total:.2f}s)" if connect else f"  Stream {i+1}: No tokens received (no metrics)")
 
     if successful:
         print(f"\n  Avg first token: {sum(successful)/len(successful):.3f}s")
@@ -968,6 +884,8 @@ async def main():
                         help="Output device index for playback (sounddevice)")
     parser.add_argument("--all-samples", action="store_true",
                         help="Run over all wavs in samples/wav24k instead of a single file")
+    parser.add_argument("--no-tui", action="store_true",
+                        help="Disable TUI mode for parallel tests (debug)")
     args = parser.parse_args()
 
     uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
@@ -1050,6 +968,7 @@ async def main():
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
+                    no_tui=args.no_tui,
                 )
                 if stop_event and stop_event.is_set():
                     break
