@@ -618,6 +618,29 @@ async def run_sequential_samples(
         print(f"  {r['file']} run {r['run']}: first_token={ft_str}, tokens={r.get('token_count', 0)}")
 
 
+async def quick_warmup(uri: str, auth_headers: dict | None) -> bool:
+    """Quick warmup: just connect and send minimal audio to wake up the server."""
+    try:
+        async with websockets.connect(
+            uri,
+            additional_headers=auth_headers,
+            open_timeout=60,
+            close_timeout=5,
+        ) as ws:
+            # Send 0.5s of silence (24kHz, int16)
+            silence = np.zeros(12000, dtype=np.int16)
+            await ws.send(silence.tobytes())
+            # Wait briefly for any response
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        return True
+    except Exception as e:
+        print(f"Warmup connection failed: {e}")
+        return False
+
+
 async def run_parallel_test(
     uri: str,
     num_streams: int,
@@ -633,19 +656,11 @@ async def run_parallel_test(
     """Run multiple streams in parallel to test concurrent handling."""
 
     if warmup:
-        print("Warmup request (excludes cold boot from stats)...")
-        try:
-            await measure_latency(
-                uri,
-                wav_path=wav_path,
-                auth_headers=auth_headers,
-                real_time_factor=real_time_factor,
-                expected_text=expected_text,
-                stop_event=stop_event,
-            )
-            print("Warmup complete.\n")
-        except Exception as e:
-            print(f"Warmup failed: {e}\n")
+        print("Warmup...", end=" ", flush=True)
+        if await quick_warmup(uri, auth_headers):
+            print("done.\n")
+        else:
+            print("failed (continuing anyway).\n")
 
     if not RICH_AVAILABLE:
         # Fallback: run without TUI
@@ -986,13 +1001,24 @@ async def main():
     quit_task = asyncio.create_task(_quit_watcher(stop_event))
 
     try:
+        # Gather wav paths first
+        wav_paths = []
+        if args.all_samples:
+            latency_set = sorted(Path("samples/wav24k").glob("latency_example_*.wav"))
+            wav_paths = latency_set if latency_set else sorted(Path("samples/wav24k").glob("*.wav"))
+            if not wav_paths:
+                print("No wav files found in samples/wav24k")
+                return
+        else:
+            wav_paths = [Path(args.wav)]
+
         if args.compare_gpus:
             gpus = [g.strip() for g in args.compare_gpus.split(",")]
             num_streams = args.parallel if args.parallel > 0 else 3
             await compare_gpus(
                 gpus,
                 num_streams,
-                args.wav,
+                str(wav_paths[0]),
                 auth_headers,
                 args.rtf,
                 expected_text,
@@ -1001,30 +1027,31 @@ async def main():
                 playback_device=args.playback_device,
             )
         elif args.parallel > 0:
-            await run_parallel_test(
-                uri,
-                args.parallel,
-                args.wav,
-                auth_headers,
-                args.rtf,
-                expected_text,
-                warmup=not args.no_warmup,
-                stop_event=stop_event,
-                playback=args.playback,
-                playback_device=args.playback_device,
-            )
+            # Parallel mode: run streams in parallel, cycling through samples
+            for wav_path in wav_paths:
+                file_expected = load_expected_text(str(wav_path))
+                if len(wav_paths) > 1:
+                    print(f"\n{'='*50}")
+                    print(f"Sample: {wav_path.name}")
+                    print('='*50)
+                await run_parallel_test(
+                    uri,
+                    args.parallel,
+                    str(wav_path),
+                    auth_headers,
+                    args.rtf,
+                    file_expected,
+                    warmup=not args.no_warmup,
+                    stop_event=stop_event,
+                    playback=args.playback,
+                    playback_device=args.playback_device,
+                )
+                if stop_event and stop_event.is_set():
+                    break
+                # Only warmup on first sample
+                args.no_warmup = True
         else:
             # Sequential mode
-            wav_paths = []
-            if args.all_samples:
-                latency_set = sorted(Path("samples/wav24k").glob("latency_example_*.wav"))
-                wav_paths = latency_set if latency_set else sorted(Path("samples/wav24k").glob("*.wav"))
-                if not wav_paths:
-                    print("No wav files found in samples/wav24k")
-                    return
-            else:
-                wav_paths = [Path(args.wav)]
-
             # Default runs: 1 for --all-samples, 3 otherwise
             runs = args.runs if args.runs is not None else (1 if args.all_samples else 3)
 
