@@ -618,8 +618,12 @@ async def run_sequential_samples(
         print(f"  {r['file']} run {r['run']}: first_token={ft_str}, tokens={r.get('token_count', 0)}")
 
 
-async def quick_warmup(uri: str, auth_headers: dict | None) -> bool:
-    """Quick warmup: just connect and send minimal audio to wake up the server."""
+async def quick_warmup(uri: str, auth_headers: dict | None) -> float | None:
+    """Quick warmup: just connect and send minimal audio to wake up the server.
+
+    Returns connection time in seconds, or None if failed.
+    """
+    start = time.perf_counter()
     try:
         async with websockets.connect(
             uri,
@@ -635,10 +639,10 @@ async def quick_warmup(uri: str, auth_headers: dict | None) -> bool:
                 await asyncio.wait_for(ws.recv(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
-        return True
+        return time.perf_counter() - start
     except Exception as e:
         print(f"Warmup connection failed: {e}")
-        return False
+        return None
 
 
 async def run_parallel_test(
@@ -657,10 +661,11 @@ async def run_parallel_test(
 
     if warmup:
         print("Warmup...", end=" ", flush=True)
-        if await quick_warmup(uri, auth_headers):
-            print("done.\n")
+        warmup_time = await quick_warmup(uri, auth_headers)
+        if warmup_time is not None:
+            print(f"done ({warmup_time:.2f}s)\n")
         else:
-            print("failed (continuing anyway).\n")
+            print("failed (continuing anyway)\n")
 
     if not RICH_AVAILABLE:
         # Fallback: run without TUI
