@@ -40,10 +40,6 @@ htmlcov/
 # Modal
 .modal/
 
-# Samples (generated)
-samples/wav24k/
-samples/manifest.jsonl
-
 # Environment
 .env
 .env.local
@@ -52,11 +48,6 @@ samples/manifest.jsonl
 credentials.json
 *.pem
 *.key
-
-# Large files
-*.wav
-*.mp3
-*.flac
 
 # OS
 .DS_Store
@@ -68,3 +59,6 @@ logs/
 
 # uv
 uv.lock
+
+test_audio.wav
+test_audio.json

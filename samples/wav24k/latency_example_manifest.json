@@ -1,0 +1,62 @@
+[
+  {
+    "id": "latency_example_01",
+    "text": "No, I mean, why are they still sometimes so brittle, memorising that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is Tom Smith?",
+    "start": 112.9800033569336,
+    "end": 121.5199966430664,
+    "duration": 8.539993286132812,
+    "paths": {
+      "wav": "samples/wav24k/latency_example_01.wav",
+      "txt": "samples/wav24k/latency_example_01.wav.txt",
+      "words": "samples/wav24k/latency_example_01.wav.words.json"
+    }
+  },
+  {
+    "id": "latency_example_02",
+    "text": "The truth lies somewhere in the middle, and look, even the lead developer for Claude code said as much later on in a reply after saying all of the code for Claude co-work was written by Claude Opus 4.5.",
+    "start": 342.5199890136719,
+    "end": 355.70001220703125,
+    "duration": 13.180023193359375,
+    "paths": {
+      "wav": "samples/wav24k/latency_example_02.wav",
+      "txt": "samples/wav24k/latency_example_02.wav.txt",
+      "words": "samples/wav24k/latency_example_02.wav.words.json"
+    }
+  },
+  {
+    "id": "latency_example_03",
+    "text": "In fact, productivity growth in 2025 looks smaller than that for, say, 2000 to 2007 in every period.",
+    "start": 578.760009765625,
+    "end": 586.719970703125,
+    "duration": 7.9599609375,
+    "paths": {
+      "wav": "samples/wav24k/latency_example_03.wav",
+      "txt": "samples/wav24k/latency_example_03.wav.txt",
+      "words": "samples/wav24k/latency_example_03.wav.words.json"
+    }
+  },
+  {
+    "id": "latency_example_04",
+    "text": "If the under prefix isn't the usual meaning of beneath, is it like the under of undergo or under the circumstances?",
+    "start": 800.97998046875,
+    "end": 808.1799926757812,
+    "duration": 7.20001220703125,
+    "paths": {
+      "wav": "samples/wav24k/latency_example_04.wav",
+      "txt": "samples/wav24k/latency_example_04.wav.txt",
+      "words": "samples/wav24k/latency_example_04.wav.words.json"
+    }
+  },
+  {
+    "id": "latency_example_05",
+    "text": "For an LLM, the first time they hear, Tom Smith's wife is Mary, that just updates their weights as to predicting what comes after, in the future, Tom Smith's wife is, or maybe permutations like, the wife of Tom Smith is.",
+    "start": 1034.199951171875,
+    "end": 1047.97998046875,
+    "duration": 13.780029296875,
+    "paths": {
+      "wav": "samples/wav24k/latency_example_05.wav",
+      "txt": "samples/wav24k/latency_example_05.wav.txt",
+      "words": "samples/wav24k/latency_example_05.wav.words.json"
+    }
+  }
+]

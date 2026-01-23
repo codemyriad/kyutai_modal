@@ -1,0 +1,1 @@
+For an LLM, the first time they hear, Tom Smith's wife is Mary, that just updates their weights as to predicting what comes after, in the future, Tom Smith's wife is, or maybe permutations like, the wife of Tom Smith is.
