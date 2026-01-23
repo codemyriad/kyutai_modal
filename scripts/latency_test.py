@@ -9,7 +9,6 @@ import os
 import signal
 import sys
 import time
-from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
@@ -19,25 +18,132 @@ try:
     from rich.console import Console
     from rich.live import Live
     from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        SpinnerColumn,
-        TaskProgressColumn,
-        TextColumn,
-        TimeElapsedColumn,
-    )
-    from rich.table import Table
     from rich.text import Text
 
     RICH_AVAILABLE = True
 except Exception:
-    Console = Live = Panel = Progress = SpinnerColumn = TextColumn = BarColumn = TaskProgressColumn = TimeElapsedColumn = Table = Text = None
+    Console = Live = Panel = Text = None
     RICH_AVAILABLE = False
+
+
+class PlaybackBuffer:
+    """Thread-safe buffer for streaming audio playback."""
+
+    def __init__(self):
+        self._q: queue.Queue[np.ndarray] = queue.Queue()
+        self._buf = np.array([], dtype=np.float32)
+
+    def write(self, chunk: np.ndarray):
+        self._q.put(chunk.astype(np.float32))
+
+    def read(self, frames: int) -> np.ndarray:
+        out = []
+        needed = frames
+        while needed > 0:
+            if self._buf.size == 0:
+                try:
+                    self._buf = self._q.get_nowait()
+                except queue.Empty:
+                    out.append(np.zeros(needed, dtype=np.float32))
+                    break
+            take = min(needed, self._buf.size)
+            out.append(self._buf[:take])
+            self._buf = self._buf[take:]
+            needed -= take
+        return np.concatenate(out) if out else np.zeros(frames, dtype=np.float32)
 
 # Modal workspace name (set via MODAL_WORKSPACE env var or change default)
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
 CHUNK_DURATION_S = 0.08  # 80ms chunks to mirror realtime streaming
+
+
+def _normalize_word(w: str) -> str:
+    """Normalize a word for comparison."""
+    return w.lower().strip(",.!?;:'\"")
+
+
+def _words_match(w1: str, w2: str) -> bool:
+    """Check if two words match, allowing for minor spelling differences."""
+    n1 = _normalize_word(w1)
+    n2 = _normalize_word(w2)
+    if n1 == n2:
+        return True
+    # Allow edit distance of 1 for words of 5+ chars (handles memorising/memorizing)
+    if len(n1) >= 5 and len(n2) >= 5:
+        if abs(len(n1) - len(n2)) <= 1:
+            # Simple check: same start and end, differ by at most 1 char
+            diffs = sum(1 for a, b in zip(n1, n2) if a != b)
+            diffs += abs(len(n1) - len(n2))
+            return diffs <= 1
+    return False
+
+
+def _color_diff(expected: str, actual: str) -> str:
+    """
+    Color the actual text using LCS alignment with expected.
+
+    - Green: matching words
+    - Red: extra words in actual (not in expected)
+    - Dim: missing words (in expected but not actual)
+    """
+    if not actual:
+        return "[dim]...[/dim]"
+
+    exp_words = expected.split()
+    act_words = actual.split()
+
+    # Build LCS table
+    m, n = len(exp_words), len(act_words)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if _words_match(exp_words[i-1], act_words[j-1]):
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+
+    # Backtrack to find alignment
+    i, j = m, n
+    ops = []
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and _words_match(exp_words[i-1], act_words[j-1]):
+            ops.append(("match", act_words[j-1]))
+            i -= 1
+            j -= 1
+        elif j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j]):
+            ops.append(("extra", act_words[j-1]))
+            j -= 1
+        else:
+            ops.append(("missing", exp_words[i-1]))
+            i -= 1
+
+    ops.reverse()
+
+    # Find where trailing missing words start (future text, not errors)
+    # Trailing = consecutive "missing" ops at the end
+    trailing_start = len(ops)
+    for idx in range(len(ops) - 1, -1, -1):
+        if ops[idx][0] == "missing":
+            trailing_start = idx
+        else:
+            break
+
+    # Render with colors
+    parts = []
+    for idx, (op, word) in enumerate(ops):
+        if op == "match":
+            parts.append(f"[green]{word}[/green]")
+        elif op == "extra":
+            parts.append(f"[red]{word}[/red]")
+        elif idx >= trailing_start:
+            # Trailing missing = future text, just dim
+            parts.append(f"[dim]{word}[/dim]")
+        else:
+            # Missing in middle/start = incorrectly skipped, strikethrough
+            parts.append(f"[dim strike]{word}[/dim strike]")
+
+    return " ".join(parts)
 
 
 async def _stream_audio(
@@ -54,18 +160,22 @@ async def _stream_audio(
     send_start = time.perf_counter()
     bytes_sent = 0
 
-    for i in range(0, len(audio), chunk_size):
-        chunk = audio[i : i + chunk_size]
-        if chunk.size == 0:
-            continue
-        await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
-        if playback_buffer is not None:
-            playback_buffer.write(chunk)
-        bytes_sent += chunk.nbytes
-        if progress_update:
-            progress_update(bytes_sent)
-        # Sleep to simulate live streaming (faster if rtf > 1.0)
-        await asyncio.sleep(len(chunk) / sample_rate / rtf)
+    try:
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i : i + chunk_size]
+            if chunk.size == 0:
+                continue
+            await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+            if playback_buffer is not None:
+                playback_buffer.write(chunk)
+            bytes_sent += chunk.nbytes
+            if progress_update:
+                progress_update(bytes_sent)
+            # Sleep to simulate live streaming (faster if rtf > 1.0)
+            await asyncio.sleep(len(chunk) / sample_rate / rtf)
+    except websockets.exceptions.ConnectionClosed:
+        # Server closed connection (e.g., finished processing) - this is normal
+        pass
 
     return time.perf_counter() - send_start
 
@@ -94,8 +204,16 @@ async def measure_latency(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
+    live: "Live | None" = None,
+    render_fn: "callable | None" = None,
+    state: dict | None = None,
 ):
-    """Send audio in streaming chunks and measure token latencies."""
+    """Send audio in streaming chunks and measure token latencies.
+
+    If `live` and `render_fn` are provided, uses an external Rich Live display
+    instead of creating its own (for persistent TUI across multiple tests).
+    If `state` is provided, updates it in place (for external state tracking).
+    """
     import soundfile as sf
 
     # Load real audio file
@@ -103,16 +221,9 @@ async def measure_latency(
     if sr != 24000:
         raise ValueError(f"Expected 24kHz, got {sr}")
 
-    # Optional word-level timeline (produced by annotate_samples.py)
-    words_path = f"{wav_path}.words.json"
-    word_timeline = None
-    if os.path.exists(words_path):
-        try:
-            import json as _json
-
-            word_timeline = _json.loads(Path(words_path).read_text(encoding="utf-8"))
-        except Exception:
-            word_timeline = None
+    # Add 2 seconds of silence at the end to let the model finish
+    silence = np.zeros(int(sr * 2), dtype=np.float32)
+    audio = np.concatenate([audio, silence])
 
     playback_stream = None
     playback_buffer = None
@@ -120,29 +231,8 @@ async def measure_latency(
         try:
             import sounddevice as sd
 
-            class PlaybackBuffer:
-                def __init__(self):
-                    self._q = queue.Queue()
-                    self._buf = np.array([], dtype=np.float32)
-
-                def write(self, chunk: np.ndarray):
-                    self._q.put(chunk.astype(np.float32))
-
-                def read(self, frames: int) -> np.ndarray:
-                    out = []
-                    needed = frames
-                    while needed > 0:
-                        if self._buf.size == 0:
-                            try:
-                                self._buf = self._q.get_nowait()
-                            except queue.Empty:
-                                out.append(np.zeros(needed, dtype=np.float32))
-                                break
-                        take = min(needed, self._buf.size)
-                        out.append(self._buf[:take])
-                        self._buf = self._buf[take:]
-                        needed -= take
-                    return np.concatenate(out) if out else np.zeros(frames, dtype=np.float32)
+            # Disable input device to prevent BT headphones switching to handsfree profile
+            sd.default.device = (None, playback_device)
 
             playback_buffer = PlaybackBuffer()
 
@@ -161,276 +251,396 @@ async def measure_latency(
                 blocksize=int(sr * CHUNK_DURATION_S),
             )
             playback_stream.start()
-            print(f"Playback enabled (device: {playback_device or 'default'})")
         except Exception as exc:
             print(f"Playback disabled (failed to init): {exc}")
             playback_stream = None
             playback_buffer = None
 
-    audio_seconds = len(audio) / 24000
-    print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
-
-    pcm_bytes = np.asarray(audio, dtype=np.float32).tobytes()
-    print(f"PCM payload: {len(pcm_bytes)} bytes")
-
-    print(f"Connecting to {uri}...")
-    connect_start = time.perf_counter()
+    audio_seconds = len(audio) / sr
+    if not RICH_AVAILABLE:
+        print(f"Audio: {audio_seconds:.1f}s ({len(audio)} samples)")
+        print(f"Connecting to {uri}...")
 
     if stop_event and stop_event.is_set():
         return {}
 
     console = Console() if RICH_AVAILABLE else None
-    live = None
-    state = {}
+    external_live = live is not None  # Track if we're using an external display
+    if state is None:
+        state = {}
     bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
+
+    # Initialize state for "connecting" phase
+    connect_start = time.perf_counter()
+    state.update({
+        "status": "connecting",
+        "rtf": real_time_factor,
+        "audio_len": audio_seconds,
+        "sent_bytes": 0,
+        "total_bytes": audio.nbytes,
+        "tokens": 0,
+        "connect_start": connect_start,
+        "connect_time": None,
+        "first_token": None,
+        "send_time": None,
+        "total_time": None,
+        "bear_idx": 0,
+        "expected_text": expected_text,
+        "recognized_text": "",
+    })
 
     def render_dashboard():
         if not RICH_AVAILABLE:
             return None
-        pct = (
-            state["sent_bytes"] / state["total_bytes"]
-            if state.get("total_bytes")
-            else 0.0
-        )
-        bar_len = 24
+
+        def fmt(v):
+            return f"[cyan]{v:.2f}s[/cyan]" if v is not None else "[dim]--[/dim]"
+
+        # Status with color
+        status = state.get("status", "--")
+        if status == "connecting" and state.get("connect_start"):
+            elapsed = time.perf_counter() - state["connect_start"]
+            status = f"[yellow]connecting ({elapsed:.1f}s)[/yellow]"
+        elif status == "streaming":
+            status = f"[cyan]{status}[/cyan]"
+        elif status == "complete":
+            status = f"[green]{status}[/green]"
+
+        # Compact progress bar
+        pct = state["sent_bytes"] / state["total_bytes"] if state.get("total_bytes") else 0.0
+        bar_len = 20
         filled = int(bar_len * pct)
-        bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim] {pct*100:5.1f}%"
+        bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim]"
 
-        def fmt(v, suffix="s"):
-            return f"{v:.3f}{suffix}" if v is not None else "--"
+        # Build compact display
+        lines = []
+        lines.append(f"[dim]{state.get('audio_len', 0):.1f}s @ {state.get('rtf', 1.0)}x[/dim]  {status}  [dim]connect:[/dim]{fmt(state.get('connect_time'))}  [dim]first:[/dim]{fmt(state.get('first_token'))}")
+        lines.append(f"{bar} {pct*100:5.1f}%")
 
-        table = Table.grid(padding=(0, 1))
-        table.add_column(justify="left", ratio=2, style="white")
-        table.add_column(justify="right", ratio=1, style="cyan")
-
-        table.add_row("Status", state.get("status", "--"))
-        table.add_row("RT factor", f"{state.get('rtf', 1.0)}x")
-        table.add_row("Audio", f"{state.get('audio_len', 0):.1f}s")
-        table.add_row("Connect", fmt(state.get("connect_time")))
-        table.add_row("Send", bar if state.get("total_bytes") else "--")
-        table.add_row("Send time", fmt(state.get("send_time")))
-        table.add_row("Tokens", str(state.get("tokens", 0)))
-        table.add_row("First token", fmt(state.get("first_token")))
-        table.add_row("10th token", fmt(state.get("tenth_token")))
-        table.add_row("Last token", fmt(state.get("last_token")))
-        table.add_row("Total time", fmt(state.get("total_time")))
-        if state.get("words_total"):
-            table.add_row(
-                "Words",
-                f"{state.get('words_matched', 0)}/{state.get('words_total')} "
-                f"({(state.get('words_matched', 0)/state.get('words_total'))*100:4.1f}%)",
-            )
-        if state.get("similarity") is not None:
-            table.add_row("Similarity", f"{state['similarity']*100:5.1f}%")
+        if state.get("expected_text"):
+            expected = state["expected_text"]
+            actual = state.get("recognized_text", "")
+            lines.append(f"[blue]expect:[/blue] {expected}")
+            lines.append(f"[blue]actual:[/blue] {_color_diff(expected, actual)}")
 
         bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
-        content = table
+        content = "\n".join(lines)
+        return Panel(content, title=f"[magenta]{bear} STT[/magenta]", border_style="magenta", padding=(0, 1))
 
-        if state.get("expected_text") and Text:
-            exp_text = state.get("expected_render") or Text(state["expected_text"])
-            grid = Table.grid(expand=True)
-            grid.add_column(ratio=1)
-            grid.add_column(ratio=2)
-            grid.add_row(table, Panel(exp_text, title="Expected vs recognized", border_style="green"))
-            content = grid
+    # Use render_fn if provided (for external TUI), otherwise local render_dashboard
+    render = render_fn if render_fn else render_dashboard
 
-        return Panel(content, title=f"[magenta]{bear} Kyutai STT Latency[/magenta]", border_style="magenta")
+    # Start Live display BEFORE connecting so we can show connection progress
+    if RICH_AVAILABLE and not external_live:
+        live = Live(render(), console=console, refresh_per_second=12, screen=True)
+        live.start()
 
-    async with websockets.connect(
-        uri,
-        additional_headers=auth_headers,
-        open_timeout=180,
-        close_timeout=10,
-    ) as ws:
-        connect_time = time.perf_counter() - connect_start
-        print(f"Connected in {connect_time:.2f}s")
-
-        # Init UI state
-        state = {
-            "status": "connected",
-            "rtf": real_time_factor,
-            "audio_len": audio_seconds,
-            "sent_bytes": 0,
-            "total_bytes": audio.nbytes,
-            "tokens": 0,
-            "connect_time": connect_time,
-            "first_token": None,
-            "tenth_token": None,
-            "last_token": None,
-            "send_time": None,
-            "total_time": None,
-            "bear_idx": 0,
-            "expected_text": expected_text,
-            "expected_render": None,
-            "similarity": None,
-            "word_timeline": word_timeline,
-            "words_matched": 0,
-            "words_total": len(word_timeline) if word_timeline else 0,
-        }
-
-        if RICH_AVAILABLE:
-            live = Live(render_dashboard(), console=console, refresh_per_second=12, screen=True)
-            live.start()
-
-        # Stream audio in chunks to mirror realtime usage
-        print(f"Streaming audio at {real_time_factor}x realtime...")
-        start_time = time.perf_counter()
-
-        def progress_update(sent_bytes: int):
-            state["sent_bytes"] = sent_bytes
-            state["status"] = "streaming"
+    # Background task to update display while connecting
+    async def update_while_connecting():
+        while state.get("status") == "connecting":
             if live:
-                live.update(render_dashboard())
+                live.update(render())
+            await asyncio.sleep(0.25)
 
-        send_task = asyncio.create_task(
-            _stream_audio(
-                ws,
-                audio,
-                sr,
-                real_time_factor,
-                progress_update=progress_update,
-                playback_buffer=playback_buffer,
+    update_task = asyncio.create_task(update_while_connecting()) if live else None
+
+    # Initialize variables that may be used after the try block
+    connect_time = 0.0
+    send_time = 0.0
+    total_time = 0.0
+    token_times: list[float] = []
+    tokens: list[str] = []
+    full_text = ""
+
+    try:
+        async with websockets.connect(
+            uri,
+            additional_headers=auth_headers,
+            open_timeout=180,
+            close_timeout=10,
+        ) as ws:
+            connect_time = time.perf_counter() - connect_start
+            state["status"] = "connected"
+            state["connect_time"] = connect_time
+
+            if update_task:
+                update_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await update_task
+
+            if not RICH_AVAILABLE:
+                print(f"Connected in {connect_time:.2f}s")
+
+            if live:
+                live.update(render())
+
+            if not RICH_AVAILABLE:
+                print(f"Streaming audio at {real_time_factor}x realtime...")
+            start_time = time.perf_counter()
+
+            def progress_update(sent_bytes: int):
+                state["sent_bytes"] = sent_bytes
+                state["status"] = "streaming"
+                if live:
+                    live.update(render())
+
+            send_task = asyncio.create_task(
+                _stream_audio(
+                    ws,
+                    audio,
+                    sr,
+                    real_time_factor,
+                    progress_update=progress_update,
+                    playback_buffer=playback_buffer,
+                )
             )
-        )
 
-        # Receive tokens
-        tokens = []
-        token_times = []
-        last_msg_ts = time.perf_counter()
-        recognized_text = ""
+            # Receive tokens
+            tokens = []
+            token_times = []
+            last_msg_ts = time.perf_counter()
+            recognized_text = ""
+            send_time = 0.0  # Will be updated when send_task completes
 
-        def update_expected_render():
-            if not expected_text:
-                return
-            matcher = SequenceMatcher(None, expected_text, recognized_text)
-            state["similarity"] = matcher.ratio()
-            if not Text:
-                return
-            text_out = Text()
-            last_idx = 0
-            for i, j, n in matcher.get_matching_blocks():
-                if i > last_idx:
-                    text_out.append(expected_text[last_idx:i], style="dim")
-                if n:
-                    text_out.append(expected_text[i : i + n], style="bold green")
-                last_idx = i + n
-            if last_idx < len(expected_text):
-                text_out.append(expected_text[last_idx:], style="dim")
-            state["expected_render"] = text_out
-            if state.get("word_timeline"):
-                recognized_words = [w.strip(" ,.!?;:").lower() for w in recognized_text.split() if w.strip()]
-                expected_words = [w["word"].strip(" ,.!?;:").lower() for w in state["word_timeline"]]
-                matched = 0
-                for rw, ew in zip(recognized_words, expected_words):
-                    if rw == ew:
-                        matched += 1
-                    else:
-                        break
-                state["words_matched"] = matched
+            def update_recognized():
+                state["recognized_text"] = recognized_text
 
-        try:
-            while True:
-                if stop_event and stop_event.is_set():
-                    break
-                # Stop after inactivity once audio is fully sent
-                timeout = 2.0
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
-                        break
+            def handle_token(text: str):
+                """Process a received token and update state."""
+                nonlocal recognized_text
+                tokens.append(text)
+                recognized_text = "".join(tokens)
+                token_times.append(last_msg_ts - start_time)
+                if len(token_times) == 1:
+                    state["first_token"] = token_times[0]
+                    state["first_token_text"] = text
+                state["tokens"] = len(tokens)
+                state["bear_idx"] = len(tokens)
+                update_recognized()
+                if live:
+                    live.update(render())
+
+            try:
+                while True:
                     if stop_event and stop_event.is_set():
                         break
-                    continue
+                    # Stop after inactivity once audio is fully sent
+                    timeout = 2.0
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
+                            break
+                        if stop_event and stop_event.is_set():
+                            break
+                        continue
 
-                data = json.loads(msg)
-                last_msg_ts = time.perf_counter()
+                    data = json.loads(msg)
+                    last_msg_ts = time.perf_counter()
 
-                if data.get("type") == "token":
-                    text = data.get("text", "")
-                    tokens.append(text)
-                    recognized_text = "".join(tokens)
-                    token_times.append(last_msg_ts - start_time)
-                    if len(token_times) == 1:
-                        print(f"First token in {token_times[0]:.3f}s: '{text}'")
-                        state["first_token"] = token_times[0]
-                    if len(token_times) == 10:
-                        state["tenth_token"] = token_times[9]
-                    state["last_token"] = token_times[-1]
-                    state["tokens"] = len(tokens)
-                    state["bear_idx"] = len(tokens)
-                    update_expected_render()
-                    if live:
-                        live.update(render_dashboard())
-                elif data.get("type") == "vad_end":
-                    print("VAD end detected")
-                elif data.get("type") == "ping":
-                    pass  # Server keepalive, ignore
-                elif "text" in data:  # Legacy format
-                    tokens.append(data.get("text", ""))
-                    recognized_text = "".join(tokens)
-                    token_times.append(last_msg_ts - start_time)
-                    if len(token_times) == 1:
-                        print(f"First response in {token_times[0]:.3f}s: {data.get('text', '')[:50]}")
-                        state["first_token"] = token_times[0]
-                    if len(token_times) == 10:
-                        state["tenth_token"] = token_times[9]
-                    state["last_token"] = token_times[-1]
-                    state["tokens"] = len(tokens)
-                    state["bear_idx"] = len(tokens)
-                    update_expected_render()
-                    if live:
-                        live.update(render_dashboard())
-                elif data.get("status") == "complete":
-                    break
-        except asyncio.TimeoutError:
-            print("Receive timeout (expected for streaming)")
-        except websockets.exceptions.ConnectionClosed:
-            print("Connection closed (session ended)")
+                    msg_type = data.get("type")
+                    if msg_type == "token":
+                        handle_token(data.get("text", ""))
+                    elif msg_type == "vad_end":
+                        state["vad_end"] = True
+                    elif msg_type == "ping":
+                        pass  # Server keepalive
+                    elif "text" in data:  # Legacy format
+                        handle_token(data.get("text", ""))
+                    elif data.get("status") == "complete":
+                        break
+            except asyncio.TimeoutError:
+                pass  # Expected for streaming
+            except websockets.exceptions.ConnectionClosed:
+                pass  # Session ended normally
 
-        if stop_event and stop_event.is_set() and not send_task.done():
-            send_task.cancel()
-            with contextlib.suppress(Exception):
-                await send_task
-        send_time = await send_task
-        total_time = time.perf_counter() - start_time
-        full_text = "".join(tokens)
-        state["send_time"] = send_time
-        state["total_time"] = total_time
-        state["status"] = "complete"
-    if live:
-        live.update(render_dashboard())
-        live.stop()
+            if stop_event and stop_event.is_set() and not send_task.done():
+                send_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                send_time = await send_task
+            total_time = time.perf_counter() - start_time
+            full_text = "".join(tokens)
+            state["send_time"] = send_time
+            state["total_time"] = total_time
+            state["status"] = "complete"
+            if live:
+                live.update(render())
+    except Exception as e:
+        # Connection failed - update state and re-raise
+        state["status"] = f"error: {e}"
+        if update_task:
+            update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await update_task
+        if live:
+            live.update(render())
+        raise
+    finally:
+        # Only stop the live display if we created it (not external)
+        if live and not external_live:
+            live.stop()
 
     if playback_stream:
         with contextlib.suppress(Exception):
             playback_stream.stop()
             playback_stream.close()
 
-    print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
-    print(f"\nTotal round-trip: {total_time:.3f}s")
-    print(f"  Connect: {connect_time:.2f}s")
-    print(f"  Send: {send_time:.3f}s")
-    if token_times:
-        late = token_times[min(len(token_times) - 1, 9)]
-        print(f"  First token: {token_times[0]:.3f}s")
-        print(f"  10th token: {late:.3f}s" if len(token_times) >= 10 else f"  Last token: {token_times[-1]:.3f}s")
-        print(f"  Final token: {token_times[-1]:.3f}s")
-        if expected_text and state.get("similarity") is not None:
-            print(f"  Similarity vs expected: {state['similarity']*100:5.1f}%")
-    else:
-        print("  No tokens received")
-    print(f"  Total tokens: {len(tokens)}")
+    # Only print summary if not using external TUI (it will show results differently)
+    if not external_live:
+        print(f"\nTranscription: {full_text[:100]}{'...' if len(full_text) > 100 else ''}")
+        print(f"\nTotal round-trip: {total_time:.3f}s")
+        print(f"  Connect: {connect_time:.2f}s")
+        print(f"  Send: {send_time:.3f}s")
+        if token_times:
+            print(f"  First token: {token_times[0]:.3f}s")
+        else:
+            print("  No tokens received")
+        print(f"  Tokens: {len(tokens)}")
 
     return {
         "connect_time": connect_time,
         "send_time": send_time,
         "first_token_time": token_times[0] if token_times else None,
-        "last_token_time": token_times[-1] if token_times else None,
         "total_time": total_time,
         "token_count": len(tokens),
-        "similarity": state.get("similarity"),
     }
+
+
+async def run_sequential_samples(
+    uri: str,
+    wav_paths: list,
+    auth_headers: dict | None,
+    real_time_factor: float,
+    runs_per_sample: int,
+    load_expected_fn: callable,
+    stop_event: asyncio.Event | None = None,
+    playback: bool = False,
+    playback_device: int | None = None,
+):
+    """Run multiple samples sequentially with a persistent TUI."""
+    if not RICH_AVAILABLE:
+        # Fall back to simple loop without persistent TUI
+        for wav_path in wav_paths:
+            file_expected = load_expected_fn(str(wav_path))
+            for i in range(runs_per_sample):
+                print(f"\n{'='*50}")
+                print(f"Test {i+1}/{runs_per_sample} - {wav_path.name}")
+                print('='*50)
+                await measure_latency(
+                    uri,
+                    wav_path=str(wav_path),
+                    auth_headers=auth_headers,
+                    real_time_factor=real_time_factor,
+                    expected_text=file_expected,
+                    stop_event=stop_event,
+                    playback=playback,
+                    playback_device=playback_device,
+                )
+                if stop_event and stop_event.is_set():
+                    break
+            if stop_event and stop_event.is_set():
+                break
+        return
+
+    # Persistent TUI mode
+    console = Console()
+    state = {}
+    session = {
+        "sample_idx": 0,
+        "run_idx": 0,
+        "total_samples": len(wav_paths),
+        "runs_per_sample": runs_per_sample,
+        "current_file": "",
+        "results": [],
+    }
+    bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
+
+    def render():
+        def fmt(v):
+            return f"[cyan]{v:.2f}s[/cyan]" if v is not None else "[dim]--[/dim]"
+
+        # Status with color
+        status = state.get("status", "--")
+        if status == "connecting" and state.get("connect_start"):
+            elapsed = time.perf_counter() - state["connect_start"]
+            status = f"[yellow]connecting ({elapsed:.1f}s)[/yellow]"
+        elif status == "streaming":
+            status = f"[cyan]{status}[/cyan]"
+        elif status == "complete":
+            status = f"[green]{status}[/green]"
+
+        # Compact progress bar
+        pct = state["sent_bytes"] / state["total_bytes"] if state.get("total_bytes") else 0.0
+        bar_len = 20
+        filled = int(bar_len * pct)
+        bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim]"
+
+        # Session info
+        total_tests = session["total_samples"] * session["runs_per_sample"]
+        current_test = session["sample_idx"] * session["runs_per_sample"] + session["run_idx"] + 1
+
+        # Build compact display
+        lines = []
+        lines.append(f"[bold]{current_test}/{total_tests}[/bold] [white]{session['current_file']}[/white]  [dim]{state.get('audio_len', 0):.1f}s @ {state.get('rtf', 1.0)}x[/dim]")
+        lines.append(f"{status}  [dim]connect:[/dim]{fmt(state.get('connect_time'))}  [dim]first:[/dim]{fmt(state.get('first_token'))}  {bar} {pct*100:5.1f}%")
+
+        if state.get("expected_text"):
+            expected = state["expected_text"]
+            actual = state.get("recognized_text", "")
+            lines.append(f"[blue]expect:[/blue] {expected}")
+            lines.append(f"[blue]actual:[/blue] {_color_diff(expected, actual)}")
+
+        bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
+        content = "\n".join(lines)
+        return Panel(content, title=f"[magenta]{bear} STT[/magenta]", border_style="magenta", padding=(0, 1))
+
+    live = Live(render(), console=console, refresh_per_second=12, screen=True)
+    live.start()
+
+    try:
+        for sample_idx, wav_path in enumerate(wav_paths):
+            session["sample_idx"] = sample_idx
+            session["current_file"] = wav_path.name
+            file_expected = load_expected_fn(str(wav_path))
+
+            for run_idx in range(runs_per_sample):
+                session["run_idx"] = run_idx
+                live.update(render())
+
+                result = await measure_latency(
+                    uri,
+                    wav_path=str(wav_path),
+                    auth_headers=auth_headers,
+                    real_time_factor=real_time_factor,
+                    expected_text=file_expected,
+                    stop_event=stop_event,
+                    playback=playback,
+                    playback_device=playback_device,
+                    live=live,
+                    render_fn=render,
+                    state=state,
+                )
+                session["results"].append({
+                    "file": wav_path.name,
+                    "run": run_idx + 1,
+                    **result,
+                })
+
+                if stop_event and stop_event.is_set():
+                    break
+            if stop_event and stop_event.is_set():
+                break
+    finally:
+        live.stop()
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print("SESSION SUMMARY")
+    print('='*60)
+    for r in session["results"]:
+        ft = r.get("first_token_time")
+        ft_str = f"{ft:.3f}s" if ft else "--"
+        print(f"  {r['file']} run {r['run']}: first_token={ft_str}, tokens={r.get('token_count', 0)}")
 
 
 async def run_parallel_test(
@@ -553,8 +763,6 @@ async def compare_gpus(
     playback_device: int | None = None,
 ):
     """Deploy each GPU to separate apps, then test all in parallel."""
-    import subprocess
-
     # Step 1: Deploy all GPU variants (can be done in parallel)
     print("=" * 60)
     print("DEPLOYING GPU VARIANTS")
@@ -640,7 +848,7 @@ async def compare_gpus(
         print(f"\nBest GPU: {best[0]} (avg {best[1]['avg']:.3f}s)")
 
     # Show cleanup command
-    print(f"\nTo clean up test apps:")
+    print("\nTo clean up test apps:")
     for gpu in gpu_urls:
         print(f"  modal app stop kyutai-stt-{gpu.lower()}")
 
@@ -651,10 +859,10 @@ async def main():
     parser = argparse.ArgumentParser(description="Measure STT transcription latency")
     parser.add_argument("--parallel", "-p", type=int, default=0,
                         help="Number of parallel streams (0 = sequential mode)")
-    parser.add_argument("--runs", "-n", type=int, default=3,
-                        help="Number of test runs (sequential mode)")
-    parser.add_argument("--wav", type=str, default="samples/wav24k/chunk_0.wav",
-                        help="Path to test audio file")
+    parser.add_argument("--runs", "-n", type=int, default=None,
+                        help="Number of test runs per sample (default: 1 with --all-samples, 3 otherwise)")
+    parser.add_argument("--wav", type=str, default="samples/wav24k/latency_example_01.wav",
+                        help="Path to test audio file (default: first latency example)")
     parser.add_argument("--rtf", type=float, default=1.0,
                         help="Realtime factor for streaming (1.0=real time, 2.0=2x faster, 4.0=4x)")
     parser.add_argument("--compare-gpus", type=str, default="",
@@ -674,18 +882,23 @@ async def main():
     args = parser.parse_args()
 
     uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
-    expected_text = args.expected
-    if expected_text is None:
-        candidate = args.expected_file
+
+    def load_expected_text(wav_path: str, explicit_text: str | None = None, explicit_file: str | None = None) -> str | None:
+        """Load expected transcript text for a wav file."""
+        if explicit_text is not None:
+            return explicit_text
+        candidate = explicit_file
         if candidate is None:
-            default_txt = f"{args.wav}.txt"
+            default_txt = f"{wav_path}.txt"
             candidate = default_txt if os.path.exists(default_txt) else None
         if candidate and os.path.exists(candidate):
             try:
-                with open(candidate, "r", encoding="utf-8") as f:
-                    expected_text = f.read().strip()
+                return Path(candidate).read_text(encoding="utf-8").strip()
             except Exception:
-                expected_text = None
+                pass
+        return None
+
+    expected_text = load_expected_text(args.wav, args.expected, args.expected_file)
 
     # Auth from environment
     modal_key = os.environ.get("MODAL_KEY")
@@ -735,32 +948,42 @@ async def main():
             # Sequential mode
             wav_paths = []
             if args.all_samples:
-                wav_paths = sorted(Path("samples/wav24k").glob("*.wav"))
+                latency_set = sorted(Path("samples/wav24k").glob("latency_example_*.wav"))
+                wav_paths = latency_set if latency_set else sorted(Path("samples/wav24k").glob("*.wav"))
                 if not wav_paths:
                     print("No wav files found in samples/wav24k")
                     return
             else:
                 wav_paths = [Path(args.wav)]
 
-            for wav_path in wav_paths:
-                for i in range(args.runs):
-                    print(f"\n{'='*50}")
-                    print(f"Test {i+1}/{args.runs} - {wav_path.name}")
-                    print('='*50)
-                    await measure_latency(
-                        uri,
-                        wav_path=str(wav_path),
-                        auth_headers=auth_headers,
-                        real_time_factor=args.rtf,
-                        expected_text=expected_text,
-                        stop_event=stop_event,
-                        playback=args.playback,
-                        playback_device=args.playback_device,
-                    )
-                    if stop_event.is_set():
-                        break
-                if stop_event.is_set():
-                    break
+            # Default runs: 1 for --all-samples, 3 otherwise
+            runs = args.runs if args.runs is not None else (1 if args.all_samples else 3)
+
+            # Use persistent TUI for multi-sample runs
+            if len(wav_paths) > 1 or runs > 1:
+                await run_sequential_samples(
+                    uri,
+                    wav_paths,
+                    auth_headers,
+                    real_time_factor=args.rtf,
+                    runs_per_sample=runs,
+                    load_expected_fn=load_expected_text,
+                    stop_event=stop_event,
+                    playback=args.playback,
+                    playback_device=args.playback_device,
+                )
+            else:
+                # Single sample, single run - use simple mode
+                await measure_latency(
+                    uri,
+                    wav_path=str(wav_paths[0]),
+                    auth_headers=auth_headers,
+                    real_time_factor=args.rtf,
+                    expected_text=expected_text,
+                    stop_event=stop_event,
+                    playback=args.playback,
+                    playback_device=args.playback_device,
+                )
     finally:
         stop_event.set()
         quit_task.cancel()
