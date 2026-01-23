@@ -22,7 +22,9 @@ import modal
 MODEL_NAME = os.getenv("MODEL_NAME", "kyutai/stt-1b-en_fr")
 KYUTAI_GPU = os.getenv("KYUTAI_GPU", "A100")
 APP_NAME = os.getenv("KYUTAI_APP_NAME", "kyutai-stt")  # Allows deploying multiple GPU variants
-MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "4"))
+# Only 1 session per container - model streaming state can't be shared
+# Modal scales containers for concurrency
+MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "1"))
 IDLE_AUDIO_TIMEOUT_SECONDS = float(os.getenv("IDLE_AUDIO_TIMEOUT_SECONDS", "10.0"))  # Close idle connections quickly
 MAX_SESSION_SECONDS = float(os.getenv("MAX_SESSION_SECONDS", "3600.0"))  # 1 hour max per session
 PING_INTERVAL_SECONDS = float(os.getenv("PING_INTERVAL_SECONDS", "10.0"))  # Detect dead connections
@@ -65,7 +67,7 @@ MINUTES = 60
     volumes=volumes,
     timeout=10 * MINUTES,  # Max 10 min per request (prevents stuck connections)
     scaledown_window=60,  # 1 minute idle before scale down
-    max_containers=2,
+    max_containers=4,  # Scale containers for concurrency (not sessions per container)
     min_containers=0,
     buffer_containers=0,  # No buffer containers
     enable_memory_snapshot=False,  # Disabled: moshi streaming state doesn't survive snapshots
@@ -140,8 +142,8 @@ class KyutaiSTTService:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        # Initialize session semaphore
-        self.session_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+        # Lock to serialize GPU inference (model is stateful, can't run concurrently)
+        self.inference_lock = asyncio.Lock()
 
         elapsed = round((time.monotonic_ns() - start_time) / 1e9, 2)
         print(f"Model loaded and warmed up in {elapsed}s")
@@ -342,24 +344,25 @@ class KyutaiSTTService:
 
                     new_pcm = pcm_out
 
-                    # Process audio and yield tokens
+                    # Process audio and yield tokens (serialized via lock)
                     try:
-                        async for msg in self.transcribe_chunk(new_pcm, all_pcm_data):
-                            if isinstance(msg, str):
-                                ok = await send_json({"type": "token", "text": msg})
-                                if not ok:
-                                    print(f"[ws] send failed for token: {msg}")
-                                    raise RuntimeError("send failed")
-                                tokens_sent += 1
-                                if tokens_sent <= 5:
-                                    print(f"[ws] sent token {tokens_sent}: {msg}")
-                            elif isinstance(msg, dict):
-                                ok = await send_json(msg)
-                                if not ok:
-                                    print(f"[ws] send failed for msg: {msg}")
-                                    raise RuntimeError("send failed")
-                            else:
-                                all_pcm_data = msg
+                        async with self.inference_lock:
+                            async for msg in self.transcribe_chunk(new_pcm, all_pcm_data):
+                                if isinstance(msg, str):
+                                    ok = await send_json({"type": "token", "text": msg})
+                                    if not ok:
+                                        print(f"[ws] send failed for token: {msg}")
+                                        raise RuntimeError("send failed")
+                                    tokens_sent += 1
+                                    if tokens_sent <= 5:
+                                        print(f"[ws] sent token {tokens_sent}: {msg}")
+                                elif isinstance(msg, dict):
+                                    ok = await send_json(msg)
+                                    if not ok:
+                                        print(f"[ws] send failed for msg: {msg}")
+                                        raise RuntimeError("send failed")
+                                else:
+                                    all_pcm_data = msg
                     except Exception as e:
                         print(f"[ws] inference/send error: {e}")
                         traceback.print_exc()
