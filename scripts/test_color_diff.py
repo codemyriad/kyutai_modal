@@ -31,9 +31,11 @@ def color_diff(expected: str, actual: str) -> list[tuple[str, str]]:
     Returns list of (text, color) tuples where color is:
     - "green": matching text
     - "red": text in actual that differs from expected
-    - "dim": text missing from actual (was in expected)
+    - "dim": text missing from actual (was in expected) - strikethrough
+    - "pending": text not yet reached in actual - just dim
 
-    Uses longest common subsequence to handle insertions/deletions.
+    Uses greedy prefix-aligned matching optimized for streaming transcription.
+    Each actual word matches with the earliest available expected word.
     """
     if not actual:
         return [("...", "dim")]
@@ -41,53 +43,42 @@ def color_diff(expected: str, actual: str) -> list[tuple[str, str]]:
     exp_words = expected.split()
     act_words = actual.split()
 
-    # Build LCS table
-    m, n = len(exp_words), len(act_words)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if words_match(exp_words[i-1], act_words[j-1]):
-                dp[i][j] = dp[i-1][j-1] + 1
-            else:
-                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-
-    # Backtrack to find alignment
-    segments = []
-    i, j = m, n
-
-    # Collect operations in reverse
+    # Greedy prefix-aligned matching
     ops = []
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and words_match(exp_words[i-1], act_words[j-1]):
-            ops.append(("match", act_words[j-1]))
-            i -= 1
-            j -= 1
-        elif j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j]):
-            ops.append(("extra", act_words[j-1]))
-            j -= 1
-        else:
-            ops.append(("missing", exp_words[i-1]))
-            i -= 1
+    exp_idx = 0
 
-    ops.reverse()
+    for act_word in act_words:
+        # Find the first matching expected word from current position
+        found_idx = None
+        for i in range(exp_idx, len(exp_words)):
+            if words_match(exp_words[i], act_word):
+                found_idx = i
+                break
 
-    # Find where trailing missing words start (future text, not errors)
-    trailing_start = len(ops)
-    for idx in range(len(ops) - 1, -1, -1):
-        if ops[idx][0] == "missing":
-            trailing_start = idx
+        if found_idx is not None:
+            # Mark all skipped expected words as missing
+            for j in range(exp_idx, found_idx):
+                ops.append(("missing", exp_words[j]))
+            # Mark this as a match
+            ops.append(("match", act_word))
+            exp_idx = found_idx + 1
         else:
-            break
+            # No match found - this is an extra word
+            ops.append(("extra", act_word))
+
+    # Remaining expected words are pending (trailing/future text)
+    for i in range(exp_idx, len(exp_words)):
+        ops.append(("pending", exp_words[i]))
 
     # Convert ops to segments, merging consecutive same-color
-    for idx, (op, word) in enumerate(ops):
+    segments = []
+    for op, word in ops:
         if op == "match":
             color = "green"
         elif op == "extra":
             color = "red"
-        elif idx >= trailing_start:
-            color = "pending"  # future text, just dim
+        elif op == "pending":
+            color = "pending"
         else:
             color = "dim"  # incorrectly skipped, strikethrough
 
@@ -213,6 +204,175 @@ class TestColorDiff:
         # No red (no extra words in actual) and no dim (no incorrectly skipped words)
         assert not any(s[1] == "red" for s in segments)
         assert not any(s[1] == "dim" for s in segments)
+
+
+class TestProgressiveRecognition:
+    """Test color_diff at various stages of recognition completion."""
+
+    EXPECTED = (
+        "No, I mean, why are they still sometimes so brittle, "
+        "memorising that Tom Smith's wife is Mary Stone, "
+        "but not deducing that Mary Stone's husband is Tom Smith?"
+    )
+
+    def test_stage_1_very_early(self):
+        """Very early recognition - just first few words."""
+        actual = "No, I mean"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # "No, I mean" should be green
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "I mean" in green_text or "mean" in green_text
+
+        # Rest should be pending (not strikethrough)
+        pending_text = " ".join(s[0] for s in segments if s[1] == "pending")
+        assert "why are they" in pending_text
+        assert "Tom Smith" in pending_text
+
+        # No incorrectly skipped words
+        assert not any(s[1] == "dim" for s in segments)
+        assert not any(s[1] == "red" for s in segments)
+
+    def test_stage_2_early(self):
+        """Early recognition - partial first clause."""
+        actual = "No, I mean, why are they still sometimes"
+        segments = color_diff(self.EXPECTED, actual)
+
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "why are they" in green_text
+        assert "sometimes" in green_text
+
+        pending_text = " ".join(s[0] for s in segments if s[1] == "pending")
+        assert "so brittle" in pending_text
+        assert "memorising" in pending_text
+
+        assert not any(s[1] == "dim" for s in segments)
+        assert not any(s[1] == "red" for s in segments)
+
+    def test_stage_3_mid_sentence(self):
+        """Mid-sentence - through first name mention.
+
+        Greedy algorithm matches "Mary" with the first occurrence in expected,
+        so all remaining text is correctly marked as pending.
+        """
+        actual = "No, I mean, why are they still sometimes so brittle, memorizing that Tom Smith's wife is Mary"
+        segments = color_diff(self.EXPECTED, actual)
+
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "brittle" in green_text
+        assert "Tom Smith's" in green_text
+        assert "Mary" in green_text
+
+        # "memorising" vs "memorizing" should fuzzy match (green)
+        assert "memorizing" in green_text or "memorising" in green_text
+
+        # All remaining text should be pending (not strikethrough)
+        pending_text = " ".join(s[0] for s in segments if s[1] == "pending")
+        assert "Stone," in pending_text
+        assert "but not deducing" in pending_text
+        assert "Tom Smith?" in pending_text
+
+        # No incorrectly skipped words
+        assert not any(s[1] == "dim" for s in segments)
+        assert not any(s[1] == "red" for s in segments)
+
+    def test_stage_4_near_complete(self):
+        """Near complete - missing just the end."""
+        actual = "No, I mean, why are they still sometimes so brittle, memorizing that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is"
+        segments = color_diff(self.EXPECTED, actual)
+
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "Mary Stone," in green_text or "Mary Stone" in green_text
+        assert "but not deducing" in green_text
+        assert "husband is" in green_text
+
+        pending_text = " ".join(s[0] for s in segments if s[1] == "pending")
+        assert "Tom Smith?" in pending_text or "Tom Smith" in pending_text
+
+        assert not any(s[1] == "dim" for s in segments)
+        assert not any(s[1] == "red" for s in segments)
+
+    def test_stage_5_complete_exact(self):
+        """Complete recognition - exact match (with spelling variation)."""
+        actual = "No, I mean, why are they still sometimes so brittle, memorizing that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is Tom Smith?"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # Everything should be green (fuzzy match handles memorising/memorizing)
+        assert all(s[1] == "green" for s in segments)
+
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "Tom Smith?" in green_text
+
+    def test_stage_6_missing_start(self):
+        """Complete but missing "No," at start - should be strikethrough."""
+        actual = "I mean, why are they still sometimes so brittle, memorizing that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is Tom Smith?"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # "No," should be dim (strikethrough - incorrectly skipped)
+        dim_text = " ".join(s[0] for s in segments if s[1] == "dim")
+        assert "No," in dim_text
+
+        # Rest should be green
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "I mean," in green_text
+        assert "Tom Smith?" in green_text
+
+        # No pending (nothing at the end missing)
+        assert not any(s[1] == "pending" for s in segments)
+
+    def test_stage_7_missing_middle(self):
+        """Missing words in the middle - should be strikethrough."""
+        actual = "No, I mean, why are they still sometimes so brittle, memorizing that Tom Smith's wife is Mary Stone, but not deducing that husband is Tom Smith?"
+        # Missing "Mary Stone's" before "husband"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # "Mary Stone's" should be dim (strikethrough)
+        dim_text = " ".join(s[0] for s in segments if s[1] == "dim")
+        assert "Mary" in dim_text and "Stone's" in dim_text
+
+        # Start and end should be green
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "Tom Smith?" in green_text
+
+    def test_stage_8_extra_words(self):
+        """Extra words inserted - should be red."""
+        actual = "No, I mean, why are they still sometimes so very brittle, memorizing that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is Tom Smith?"
+        # Extra "very" before "brittle"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # "very" should be red (extra word)
+        red_text = " ".join(s[0] for s in segments if s[1] == "red")
+        assert "very" in red_text
+
+        # Rest should be green
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "No," in green_text
+        assert "so" in green_text
+        assert "brittle," in green_text or "brittle" in green_text
+
+    def test_stage_9_wrong_word(self):
+        """Wrong word substituted - shows as missing + extra."""
+        actual = "No, I mean, why are they still sometimes so fragile, memorizing that Tom Smith's wife is Mary Stone, but not deducing that Mary Stone's husband is Tom Smith?"
+        # "fragile" instead of "brittle"
+        segments = color_diff(self.EXPECTED, actual)
+
+        # "brittle," should be dim (missing/strikethrough)
+        dim_text = " ".join(s[0] for s in segments if s[1] == "dim")
+        assert "brittle" in dim_text
+
+        # "fragile" should be red (extra)
+        red_text = " ".join(s[0] for s in segments if s[1] == "red")
+        assert "fragile" in red_text
+
+        # Surrounding text should be green
+        green_text = " ".join(s[0] for s in segments if s[1] == "green")
+        assert "so" in green_text
+        assert "memorizing" in green_text
 
 
 if __name__ == "__main__":
