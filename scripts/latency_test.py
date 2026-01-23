@@ -133,19 +133,38 @@ async def _stream_audio(
     real_time_factor: float,
     progress_update=None,
     playback_buffer=None,
+    use_msgpack: bool = False,
 ) -> float:
-    """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed."""
+    """Stream audio over WebSocket at (1x, 2x, 4x, ...) realtime speed.
+
+    Args:
+        use_msgpack: If True, encode audio as msgpack for Rust server.
+                    Format: {"type": "Audio", "pcm": [float, ...]}
+    """
     chunk_size = int(sample_rate * CHUNK_DURATION_S)
     rtf = max(0.25, real_time_factor)  # avoid zero/negative/too-slow
     send_start = time.perf_counter()
     bytes_sent = 0
+
+    # Import msgpack only if needed
+    if use_msgpack:
+        import msgpack
 
     try:
         for i in range(0, len(audio), chunk_size):
             chunk = audio[i : i + chunk_size]
             if chunk.size == 0:
                 continue
-            await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+
+            if use_msgpack:
+                # Rust server expects msgpack-encoded messages
+                msg = {"type": "Audio", "pcm": [float(x) for x in chunk]}
+                data = msgpack.packb(msg, use_bin_type=True, use_single_float=True)
+                await ws.send(data)
+            else:
+                # Python server expects raw PCM bytes
+                await ws.send(np.asarray(chunk, dtype=np.float32).tobytes())
+
             if playback_buffer is not None:
                 playback_buffer.write(chunk)
             bytes_sent += chunk.nbytes
@@ -162,16 +181,33 @@ async def _stream_audio(
 
 async def _quit_watcher(stop_event: asyncio.Event):
     """Watch stdin for 'q' to request stop."""
+    import select
+
     if not sys.stdin.isatty():
         return
+
     loop = asyncio.get_running_loop()
+
+    def read_with_timeout():
+        """Read stdin with timeout so we can check stop_event periodically."""
+        # Use select to wait for input with timeout (works on Unix)
+        ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+        if ready:
+            return sys.stdin.readline()
+        return None  # Timeout, no input
+
     while not stop_event.is_set():
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
-            break
-        if line.strip().lower() == "q":
-            print("\nQuit requested (q)")
-            stop_event.set()
+        try:
+            line = await loop.run_in_executor(None, read_with_timeout)
+            if line is None:
+                continue  # Timeout, check stop_event and loop
+            if not line:
+                break  # EOF
+            if line.strip().lower() == "q":
+                print("\nQuit requested (q)")
+                stop_event.set()
+                break
+        except Exception:
             break
 
 
@@ -188,6 +224,7 @@ async def measure_latency(
     render_fn: "callable | None" = None,
     state: dict | None = None,
     quiet: bool = False,
+    use_msgpack: bool = False,
 ):
     """Send audio in streaming chunks and measure token latencies.
 
@@ -374,6 +411,7 @@ async def measure_latency(
                     real_time_factor,
                     progress_update=progress_update,
                     playback_buffer=playback_buffer,
+                    use_msgpack=use_msgpack,
                 )
             )
 
@@ -412,20 +450,52 @@ async def measure_latency(
                             break
                         continue
 
-                    data = json.loads(msg)
                     last_msg_ts = time.perf_counter()
 
-                    msg_type = data.get("type")
-                    if msg_type == "token":
-                        handle_token(data.get("text", ""))
-                    elif msg_type == "vad_end":
-                        state["vad_end"] = True
-                    elif msg_type == "ping":
-                        pass  # Server keepalive
-                    elif "text" in data:  # Legacy format
-                        handle_token(data.get("text", ""))
-                    elif data.get("status") == "complete":
-                        break
+                    if use_msgpack:
+                        # Rust server sends msgpack-encoded messages
+                        # Text messages are prefixed with 0x01 byte
+                        import msgpack
+                        if isinstance(msg, bytes):
+                            if len(msg) > 0 and msg[0] == 0x01:
+                                # Text message - decode the rest as UTF-8
+                                text = msg[1:].decode("utf-8", errors="replace")
+                                if text:
+                                    handle_token(text)
+                            else:
+                                # Try msgpack decode
+                                try:
+                                    data = msgpack.unpackb(msg, raw=False)
+                                    if isinstance(data, dict):
+                                        if data.get("type") == "Text":
+                                            handle_token(data.get("text", ""))
+                                        elif data.get("type") == "VadEnd":
+                                            state["vad_end"] = True
+                                except Exception:
+                                    pass  # Ignore unparseable messages
+                        else:
+                            # String message - might be JSON
+                            try:
+                                data = json.loads(msg)
+                                if data.get("type") == "token":
+                                    handle_token(data.get("text", ""))
+                            except Exception:
+                                pass
+                    else:
+                        # Python server sends JSON
+                        data = json.loads(msg)
+
+                        msg_type = data.get("type")
+                        if msg_type == "token":
+                            handle_token(data.get("text", ""))
+                        elif msg_type == "vad_end":
+                            state["vad_end"] = True
+                        elif msg_type == "ping":
+                            pass  # Server keepalive
+                        elif "text" in data:  # Legacy format
+                            handle_token(data.get("text", ""))
+                        elif data.get("status") == "complete":
+                            break
             except asyncio.TimeoutError:
                 pass  # Expected for streaming
             except websockets.exceptions.ConnectionClosed:
@@ -493,6 +563,7 @@ async def run_sequential_samples(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
+    use_msgpack: bool = False,
 ):
     """Run multiple samples sequentially with a persistent TUI."""
     if not RICH_AVAILABLE:
@@ -512,6 +583,7 @@ async def run_sequential_samples(
                     stop_event=stop_event,
                     playback=playback,
                     playback_device=playback_device,
+                    use_msgpack=use_msgpack,
                 )
                 if stop_event and stop_event.is_set():
                     break
@@ -596,6 +668,7 @@ async def run_sequential_samples(
                     live=live,
                     render_fn=render,
                     state=state,
+                    use_msgpack=use_msgpack,
                 )
                 session["results"].append({
                     "file": wav_path.name,
@@ -620,33 +693,6 @@ async def run_sequential_samples(
         print(f"  {r['file']} run {r['run']}: first_token={ft_str}, tokens={r.get('token_count', 0)}")
 
 
-async def quick_warmup(uri: str, auth_headers: dict | None) -> float | None:
-    """Quick warmup: just connect and send minimal audio to wake up the server.
-
-    Returns connection time in seconds, or None if failed.
-    """
-    start = time.perf_counter()
-    try:
-        async with websockets.connect(
-            uri,
-            additional_headers=auth_headers,
-            open_timeout=60,
-            close_timeout=5,
-        ) as ws:
-            # Send 0.5s of silence (24kHz, int16)
-            silence = np.zeros(12000, dtype=np.int16)
-            await ws.send(silence.tobytes())
-            # Wait briefly for any response
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        return time.perf_counter() - start
-    except Exception as e:
-        print(f"Warmup connection failed: {e}")
-        return None
-
-
 async def run_parallel_test(
     uri: str,
     num_streams: int,
@@ -654,43 +700,143 @@ async def run_parallel_test(
     auth_headers: dict | None,
     real_time_factor: float,
     expected_text: str | None,
-    warmup: bool = True,
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
     no_tui: bool = False,
+    use_msgpack: bool = False,
 ):
     """Run multiple streams in parallel to test concurrent handling."""
 
-    if warmup:
-        print("Warmup...", end=" ", flush=True)
-        warmup_time = await quick_warmup(uri, auth_headers)
-        if warmup_time is not None:
-            print(f"done ({warmup_time:.2f}s)\n")
-        else:
-            print("failed (continuing anyway)\n")
+    # Fall back to quiet mode if TUI not available or disabled
+    use_tui = RICH_AVAILABLE and not no_tui
 
-    # Simple parallel test without TUI (TUI doesn't work well with parallel streams)
-    print(f"Running {num_streams} parallel streams...")
+    if not use_tui:
+        # Simple parallel test without TUI
+        print(f"Running {num_streams} parallel streams...")
 
-    async def labeled_test(idx: int):
-        # Run in quiet mode - no TUI, no output
-        result = await measure_latency(
-            uri,
-            wav_path=wav_path,
-            auth_headers=auth_headers,
-            real_time_factor=real_time_factor,
-            expected_text=None,  # Skip text comparison for parallel
-            stop_event=stop_event,
-            playback=False,  # No playback in parallel mode
-            playback_device=None,
-            quiet=True,  # Suppress all output
-        )
-        return idx, result
+        async def labeled_test_quiet(idx: int):
+            result = await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=None,
+                stop_event=stop_event,
+                playback=False,
+                playback_device=None,
+                quiet=True,
+                use_msgpack=use_msgpack,
+            )
+            return idx, result
 
-    tasks = [labeled_test(i) for i in range(num_streams)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [labeled_test_quiet(i) for i in range(num_streams)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        # TUI mode with stacked panels
+        console = Console()
+        bear_frames = ["ʕ•ᴥ•ʔ", "ʕᵔᴥᵔʔ", "ʕ•̀ᴥ•́ʔ✧", "ʕ•ᴥ•ʔ♪"]
 
+        # Create separate state for each stream
+        states = [{} for _ in range(num_streams)]
+
+        def render_stream_panel(idx: int, state: dict) -> Panel:
+            """Render a single stream's panel."""
+            def fmt(v):
+                return f"[cyan]{v:.2f}s[/cyan]" if v is not None else "[dim]--[/dim]"
+
+            # Status with color
+            status = state.get("status", "pending")
+            if status == "connecting" and state.get("connect_start"):
+                elapsed = time.perf_counter() - state["connect_start"]
+                status = f"[yellow]connecting ({elapsed:.1f}s)[/yellow]"
+            elif status == "streaming":
+                status = f"[cyan]{status}[/cyan]"
+            elif status == "complete":
+                status = f"[green]{status}[/green]"
+            elif status.startswith("error"):
+                status = f"[red]{status}[/red]"
+            else:
+                status = f"[dim]{status}[/dim]"
+
+            # Progress bar
+            pct = state["sent_bytes"] / state["total_bytes"] if state.get("total_bytes") else 0.0
+            bar_len = 16
+            filled = int(bar_len * pct)
+            bar = f"[cyan]{'█'*filled}[/cyan][dim]{'·'*(bar_len-filled)}[/dim]"
+
+            # Build compact display
+            lines = []
+            lines.append(
+                f"[dim]{state.get('audio_len', 0):.1f}s @ {state.get('rtf', 1.0)}x[/dim]  "
+                f"{status}  [dim]connect:[/dim]{fmt(state.get('connect_time'))}  "
+                f"[dim]first:[/dim]{fmt(state.get('first_token'))}"
+            )
+            lines.append(f"{bar} {pct*100:5.1f}%")
+
+            if expected_text:
+                actual = state.get("recognized_text", "")
+                lines.append(f"[blue]expect:[/blue] {expected_text}")
+                lines.append(f"[blue]actual:[/blue] {_color_diff(expected_text, actual)}")
+
+            bear = bear_frames[state.get("bear_idx", 0) % len(bear_frames)]
+            content = "\n".join(lines)
+            return Panel(
+                content,
+                title=f"[magenta]{bear} Stream {idx+1}[/magenta]",
+                border_style="magenta",
+                padding=(0, 1),
+            )
+
+        def render_all():
+            """Render all stream panels stacked vertically."""
+            panels = [render_stream_panel(i, states[i]) for i in range(num_streams)]
+            return Group(*panels)
+
+        # Create live display
+        live = Live(render_all(), console=console, refresh_per_second=12, screen=True)
+        live.start()
+
+        # Flag to stop background update task
+        running = True
+
+        async def update_display():
+            """Background task to keep display updated."""
+            while running:
+                live.update(render_all())
+                await asyncio.sleep(0.1)
+
+        update_task = asyncio.create_task(update_display())
+
+        async def labeled_test_tui(idx: int):
+            result = await measure_latency(
+                uri,
+                wav_path=wav_path,
+                auth_headers=auth_headers,
+                real_time_factor=real_time_factor,
+                expected_text=expected_text,
+                stop_event=stop_event,
+                playback=False,  # No playback in parallel mode
+                playback_device=None,
+                live=live,
+                render_fn=render_all,
+                state=states[idx],
+                quiet=False,
+                use_msgpack=use_msgpack,
+            )
+            return idx, result
+
+        try:
+            tasks = [labeled_test_tui(i) for i in range(num_streams)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            running = False
+            update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await update_task
+            live.stop()
+
+    # Print summary (same for both TUI and non-TUI modes)
     print(f"\n{'='*50}")
     print("Parallel Test Summary")
     print('='*50)
@@ -766,6 +912,7 @@ async def compare_gpus(
     stop_event: asyncio.Event | None = None,
     playback: bool = False,
     playback_device: int | None = None,
+    use_msgpack: bool = False,
 ):
     """Deploy each GPU to separate apps, then test all in parallel."""
     # Step 1: Deploy all GPU variants (can be done in parallel)
@@ -801,6 +948,7 @@ async def compare_gpus(
                 stop_event=stop_event,
                 playback=playback,
                 playback_device=playback_device,
+                use_msgpack=use_msgpack,
             )
             print(f"  {gpu} warm")
             return True
@@ -826,10 +974,10 @@ async def compare_gpus(
             auth_headers,
             real_time_factor,
             expected_text,
-            warmup=False,
             stop_event=stop_event,
             playback=playback,
             playback_device=playback_device,
+            use_msgpack=use_msgpack,
         )
         if latencies:
             results[gpu] = {
@@ -872,8 +1020,6 @@ async def main():
                         help="Realtime factor for streaming (1.0=real time, 2.0=2x faster, 4.0=4x)")
     parser.add_argument("--compare-gpus", type=str, default="",
                         help="Compare GPUs (comma-separated, e.g., 'T4,L4,A10G,A100')")
-    parser.add_argument("--no-warmup", action="store_true",
-                        help="Skip warmup request")
     parser.add_argument("--expected", type=str, default=None,
                         help="Expected transcript text (for visualization/quality)")
     parser.add_argument("--expected-file", type=str, default=None,
@@ -886,9 +1032,19 @@ async def main():
                         help="Run over all wavs in samples/wav24k instead of a single file")
     parser.add_argument("--no-tui", action="store_true",
                         help="Disable TUI mode for parallel tests (debug)")
+    parser.add_argument("--url", type=str, default=None,
+                        help="Custom WebSocket URL (overrides default Modal URL)")
+    parser.add_argument("--rust-server", action="store_true",
+                        help="Use Rust server auth (kyutai-api-key header instead of Modal auth)")
     args = parser.parse_args()
 
-    uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+    if args.url:
+        uri = args.url
+    else:
+        uri = f"wss://{MODAL_WORKSPACE}--kyutai-stt-kyutaisttservice-serve.modal.run/v1/stream"
+
+    # Use msgpack encoding for Rust server
+    use_msgpack = args.rust_server
 
     def load_expected_text(wav_path: str, explicit_text: str | None = None, explicit_file: str | None = None) -> str | None:
         """Load expected transcript text for a wav file."""
@@ -908,12 +1064,17 @@ async def main():
     expected_text = load_expected_text(args.wav, args.expected, args.expected_file)
 
     # Auth from environment
-    modal_key = os.environ.get("MODAL_KEY")
-    modal_secret = os.environ.get("MODAL_SECRET")
     auth_headers = None
-    if modal_key and modal_secret:
-        auth_headers = {"Modal-Key": modal_key, "Modal-Secret": modal_secret}
-        print("Using Modal proxy authentication\n")
+    if args.rust_server:
+        # Rust server uses kyutai-api-key header
+        auth_headers = {"kyutai-api-key": "public_token"}
+        print("Using Rust server authentication (kyutai-api-key)\n")
+    else:
+        modal_key = os.environ.get("MODAL_KEY")
+        modal_secret = os.environ.get("MODAL_SECRET")
+        if modal_key and modal_secret:
+            auth_headers = {"Modal-Key": modal_key, "Modal-Secret": modal_secret}
+            print("Using Modal proxy authentication\n")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -948,6 +1109,7 @@ async def main():
                 stop_event=stop_event,
                 playback=args.playback,
                 playback_device=args.playback_device,
+                use_msgpack=use_msgpack,
             )
         elif args.parallel > 0:
             # Parallel mode: run streams in parallel, cycling through samples
@@ -964,16 +1126,14 @@ async def main():
                     auth_headers,
                     args.rtf,
                     file_expected,
-                    warmup=not args.no_warmup,
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
                     no_tui=args.no_tui,
+                    use_msgpack=use_msgpack,
                 )
                 if stop_event and stop_event.is_set():
                     break
-                # Only warmup on first sample
-                args.no_warmup = True
         else:
             # Sequential mode
             # Default runs: 1 for --all-samples, 3 otherwise
@@ -991,6 +1151,7 @@ async def main():
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
+                    use_msgpack=use_msgpack,
                 )
             else:
                 # Single sample, single run - use simple mode
@@ -1003,6 +1164,7 @@ async def main():
                     stop_event=stop_event,
                     playback=args.playback,
                     playback_device=args.playback_device,
+                    use_msgpack=use_msgpack,
                 )
     finally:
         stop_event.set()
