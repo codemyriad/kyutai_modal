@@ -640,7 +640,12 @@ async def run_sequential_samples(
     for r in session["results"]:
         ft = r.get("first_token_time")
         ft_str = f"{ft:.3f}s" if ft else "--"
+        text = r.get("recognized_text", "").strip()
         print(f"  {r['file']} run {r['run']}: first_token={ft_str}, tokens={r.get('token_count', 0)}")
+        if text:
+            # Truncate long transcriptions
+            display_text = text if len(text) <= 80 else text[:77] + "..."
+            print(f"    → {display_text}")
 
 
 async def run_parallel_test(

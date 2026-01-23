@@ -320,6 +320,8 @@ class KyutaiSTTRustService:
                                                 word_data = data.get("Word", data)
                                                 text = word_data.get("text", "")
                                                 if text:
+                                                    # Convert sentencepiece space marker to regular space
+                                                    text = text.replace("\u2581", " ")
                                                     await send_json({"type": "token", "text": text})
                                                     tokens_sent += 1
                                                     if tokens_sent <= 5:
