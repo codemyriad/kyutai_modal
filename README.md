@@ -1,6 +1,6 @@
-# Kyutai STT - Real-time Speech-to-Text on Modal
+# Kyutai STT — Real-time Streaming Speech-to-Text (Modal or Local)
 
-Deploy [Kyutai's streaming STT model](https://huggingface.co/kyutai/stt-1b-en_fr) to [Modal](https://modal.com) or run it locally (Proxmox LXC) for real-time speech transcription with **~0.5 second latency**.
+Run [Kyutai's streaming STT model](https://huggingface.co/kyutai/stt-1b-en_fr) with **~0.5 second latency**. This repo ships a Python WebSocket proxy + Rust moshi-server and supports two deployment paths: Modal (serverless GPU) and local Proxmox LXC with GPU passthrough.
 
 ```
 You: "Hello, how are you today?"
@@ -10,6 +10,24 @@ Server: {"type": "token", "text": " Hello"}
         {"type": "token", "text": " how"}
         ...
 ```
+
+## What this is / isn't
+
+This repo is:
+- A production-grade streaming STT service (Python proxy + Rust moshi-server)
+- Deployable on Modal or locally in Proxmox LXC with GPU passthrough
+- A simple WebSocket protocol (raw PCM in, JSON tokens out)
+
+This repo is not:
+- A hosted SaaS or web UI
+- A general ASR benchmark suite
+- A batch transcription pipeline
+
+## Choose your path
+
+- Modal deployment: go to Quick Start (Modal)
+- Local Proxmox deployment: go to Local Deployment
+- Client usage (CLI / API): go to Usage
 
 ## Features
 
@@ -25,7 +43,7 @@ Server: {"type": "token", "text": " Hello"}
 - [uv](https://docs.astral.sh/uv/) package manager
 - Python 3.11+
 
-## Quick Start
+## Quick Start (Modal)
 
 ### 1. Install Modal CLI and authenticate
 
@@ -65,12 +83,17 @@ uv run scripts/transcribe_cli.py
 
 Speak into your microphone and see real-time transcription.
 
-## Usage
+## Local Deployment (Proxmox LXC)
 
-### Local Proxmox Deployment
+Local deployment assets live in `deploy/proxmox/`:
 
-If you deployed the local service (see `deploy/proxmox/`), it exposes the same
-WebSocket API. Use the CLI with `--service local` or override with `--url`:
+- `deploy/proxmox/PROGRESS.md`: step-by-step runbook + status
+- `deploy/proxmox/DEPLOY_LOG.md`: full build log
+- `deploy/proxmox/local_server.py`: local proxy entrypoint
+- `deploy/proxmox/kyutai-stt.service`: systemd unit
+- `deploy/proxmox/smoke-test.py`: quick WebSocket test
+
+If you already deployed the local service, it exposes the same WebSocket API. Use the CLI with `--service local` or override with `--url`:
 
 ```bash
 uv run scripts/transcribe_cli.py --service local
@@ -81,6 +104,8 @@ You can also set a custom URL:
 ```bash
 LOCAL_WS_URL=ws://192.168.1.101:8000/v1/stream uv run scripts/transcribe_cli.py --service local
 ```
+
+## Usage
 
 ### WebSocket API
 
@@ -176,7 +201,7 @@ Example:
 KYUTAI_GPU=L4 uvx modal deploy src/stt/modal_app.py
 ```
 
-## GPU Selection & Pricing
+## GPU Selection & Pricing (Modal)
 
 Modal bills per-second. Choose based on your latency and cost requirements:
 
