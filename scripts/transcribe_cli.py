@@ -57,6 +57,7 @@ except ImportError:
 
 MODAL_WORKSPACE = os.environ.get("MODAL_WORKSPACE", "YOUR_WORKSPACE")
 DEFAULT_WS_URL = f"wss://{MODAL_WORKSPACE}--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream"
+LOCAL_DEFAULT_WS_URL = os.environ.get("LOCAL_WS_URL", "ws://192.168.1.101:8000/v1/stream")
 
 SAMPLE_RATE = 24000  # Kyutai expects 24kHz audio
 CHANNELS = 1
@@ -1033,7 +1034,7 @@ async def main(args):
         pass
 
     print("\n" + "=" * 60)
-    print("  Real-time Transcription (Kyutai STT on Modal)")
+    print(f"  Real-time Transcription (Kyutai STT: {args.service})")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
 
@@ -1063,7 +1064,7 @@ async def main(args):
 def run():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Real-time microphone transcription using Kyutai STT on Modal",
+        description="Real-time microphone transcription using Kyutai STT (Modal or local)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1072,6 +1073,9 @@ Examples:
 
     # Transcribe with default microphone
     ./transcribe_cli.py
+
+    # Use local Proxmox deployment
+    ./transcribe_cli.py --service local
 
     # Transcribe with specific device
     ./transcribe_cli.py --device 2
@@ -1083,10 +1087,22 @@ Environment variables:
     )
 
     parser.add_argument(
+        "--service",
+        choices=["modal", "local"],
+        default="modal",
+        help="Which backend to use (default: modal)",
+    )
+    parser.add_argument(
         "--url",
         type=str,
-        default=DEFAULT_WS_URL,
-        help=f"WebSocket URL of the STT server (default: {DEFAULT_WS_URL})",
+        default=None,
+        help="WebSocket URL of the STT server (overrides --service)",
+    )
+    parser.add_argument(
+        "--local-url",
+        type=str,
+        default=LOCAL_DEFAULT_WS_URL,
+        help=f"Local WS URL used when --service local (default: {LOCAL_DEFAULT_WS_URL})",
     )
     parser.add_argument(
         "--device",
@@ -1124,6 +1140,9 @@ Environment variables:
     )
 
     args = parser.parse_args()
+
+    if args.url is None:
+        args.url = args.local_url if args.service == "local" else DEFAULT_WS_URL
 
     asyncio.run(main(args))
 

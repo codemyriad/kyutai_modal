@@ -1,6 +1,6 @@
 # Kyutai STT - Real-time Speech-to-Text on Modal
 
-Deploy [Kyutai's streaming STT model](https://huggingface.co/kyutai/stt-1b-en_fr) to [Modal](https://modal.com) for real-time speech transcription with **~0.5 second latency**.
+Deploy [Kyutai's streaming STT model](https://huggingface.co/kyutai/stt-1b-en_fr) to [Modal](https://modal.com) or run it locally (Proxmox LXC) for real-time speech transcription with **~0.5 second latency**.
 
 ```
 You: "Hello, how are you today?"
@@ -21,7 +21,7 @@ Server: {"type": "token", "text": " Hello"}
 
 ## Prerequisites
 
-- [Modal account](https://modal.com) (free tier available)
+- [Modal account](https://modal.com) (free tier available) if using Modal
 - [uv](https://docs.astral.sh/uv/) package manager
 - Python 3.11+
 
@@ -66,6 +66,21 @@ uv run scripts/transcribe_cli.py
 Speak into your microphone and see real-time transcription.
 
 ## Usage
+
+### Local Proxmox Deployment
+
+If you deployed the local service (see `deploy/proxmox/`), it exposes the same
+WebSocket API. Use the CLI with `--service local` or override with `--url`:
+
+```bash
+uv run scripts/transcribe_cli.py --service local
+```
+
+You can also set a custom URL:
+
+```bash
+LOCAL_WS_URL=ws://192.168.1.101:8000/v1/stream uv run scripts/transcribe_cli.py --service local
+```
 
 ### WebSocket API
 
@@ -129,6 +144,9 @@ uv run scripts/transcribe_cli.py --list-devices
 # Use specific microphone
 uv run scripts/transcribe_cli.py --device 2
 
+# Use local Proxmox service
+uv run scripts/transcribe_cli.py --service local
+
 # Latency benchmark
 uv run scripts/latency_test.py -p 4
 ```
@@ -142,6 +160,7 @@ uv run scripts/latency_test.py -p 4
 | `MODAL_WORKSPACE` | Yes | Your Modal workspace name |
 | `MODAL_KEY` | Yes | Modal proxy auth key |
 | `MODAL_SECRET` | Yes | Modal proxy auth secret |
+| `LOCAL_WS_URL` | No | Local service WebSocket URL (used with `--service local`) |
 
 ### Server Configuration (set when deploying)
 
