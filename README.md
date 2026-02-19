@@ -205,12 +205,23 @@ KYUTAI_GPU=L4 uvx modal deploy src/stt/modal_app.py
 
 Modal bills per-second. Choose based on your latency and cost requirements:
 
-| GPU | VRAM | Cost/Hour | First Token Latency |
-|-----|------|-----------|---------------------|
-| **T4** | 16GB | $0.59 | ~0.7s |
-| **L4** | 24GB | $0.80 | ~0.6s |
-| **A10G** | 24GB | $1.10 | ~0.5s |
-| **A100** | 80GB | $2.78 | ~0.5s |
+Default deployment targets **L40S** (fastest in our latest runs). Override with `KYUTAI_GPU=...` when deploying to test other cards.
+
+| GPU | VRAM | Cost/Hour | First Token Latency (warm, rtf=3, 4 streams) |
+|-----|------|-----------|----------------------------------------------|
+| **L40S (default)** | 48GB | $— | ~0.58s (avg) |
+| **A10G** | 24GB | $1.10 | ~0.65s (avg) |
+| **L4** | 24GB | $0.80 | ~1.06s (avg) |
+| **A100** | 80GB | $2.78 | ~0.5s* |
+| **T4** | 16GB | $0.59 | ~0.7s* |
+
+*A100 and T4 are older baselines; latest run covered L4/L40S/A10G. Command used:
+
+```
+uv run scripts/latency_test.py --compare-gpus "L4,L40S,A10G" -p 4 --runs 1 --rtf 3
+```
+
+Warmups showed first-token times of ~1.22s (L4), ~0.76s (L40S), ~0.96s (A10G); test phase averages above reflect first-token latency with 4 parallel streams on warm containers.
 
 **Benchmarks**: First token latency measured with 8 seconds of audio on warm container.
 

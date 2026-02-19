@@ -353,117 +353,142 @@ async def measure_latency(
     token_times: list[float] = []
     tokens: list[str] = []
     full_text = ""
+    max_connect_attempts = 6
+    connect_retry_delay = 3.0
+    attempt = 0
 
     try:
-        async with websockets.connect(
-            uri,
-            additional_headers=auth_headers,
-            open_timeout=180,
-            close_timeout=10,
-        ) as ws:
-            connect_time = time.perf_counter() - connect_start
-            state["status"] = "connected"
-            state["connect_time"] = connect_time
-
-            if update_task:
-                update_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await update_task
-
-            if not RICH_AVAILABLE and not quiet:
-                print(f"Connected in {connect_time:.2f}s")
-
-            if live:
-                live.update(render())
-
-            if not RICH_AVAILABLE and not quiet:
-                print(f"Streaming audio at {real_time_factor}x realtime...")
-            start_time = time.perf_counter()
-
-            def progress_update(sent_bytes: int):
-                state["sent_bytes"] = sent_bytes
-                state["status"] = "streaming"
-                if live:
-                    live.update(render())
-
-            send_task = asyncio.create_task(
-                _stream_audio(
-                    ws,
-                    audio,
-                    sr,
-                    real_time_factor,
-                    progress_update=progress_update,
-                    playback_buffer=playback_buffer,
-                )
-            )
-
-            # Receive tokens
-            tokens: list[str] = []
-            token_times: list[float] = []
-            last_msg_ts = time.perf_counter()
-            send_time = 0.0  # Will be updated when send_task completes
-
-            def handle_token(text: str):
-                """Process a received token and update state."""
-                tokens.append(text)
-                token_times.append(last_msg_ts - start_time)
-                # Update state directly (avoid closure issues)
-                state["recognized_text"] = "".join(tokens)
-                state["tokens"] = len(tokens)
-                state["bear_idx"] = len(tokens)
-                if len(token_times) == 1:
-                    state["first_token"] = token_times[0]
-                    state["first_token_text"] = text
-                if live:
-                    live.update(render())
-
+        while True:
+            attempt += 1
             try:
-                while True:
-                    if stop_event and stop_event.is_set():
-                        break
-                    # Stop after inactivity once audio is fully sent
-                    timeout = 2.0
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
-                            break
-                        if stop_event and stop_event.is_set():
-                            break
-                        continue
+                async with websockets.connect(
+                    uri,
+                    additional_headers=auth_headers,
+                    open_timeout=180,
+                    close_timeout=10,
+                ) as ws:
+                    connect_time = time.perf_counter() - connect_start
+                    state["status"] = "connected"
+                    state["connect_time"] = connect_time
 
+                    if update_task:
+                        update_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await update_task
+
+                    if not RICH_AVAILABLE and not quiet:
+                        print(f"Connected in {connect_time:.2f}s")
+
+                    if live:
+                        live.update(render())
+
+                    if not RICH_AVAILABLE and not quiet:
+                        print(f"Streaming audio at {real_time_factor}x realtime...")
+                    start_time = time.perf_counter()
+
+                    def progress_update(sent_bytes: int):
+                        state["sent_bytes"] = sent_bytes
+                        state["status"] = "streaming"
+                        if live:
+                            live.update(render())
+
+                    send_task = asyncio.create_task(
+                        _stream_audio(
+                            ws,
+                            audio,
+                            sr,
+                            real_time_factor,
+                            progress_update=progress_update,
+                            playback_buffer=playback_buffer,
+                        )
+                    )
+
+                    # Receive tokens
+                    tokens: list[str] = []
+                    token_times: list[float] = []
                     last_msg_ts = time.perf_counter()
+                    send_time = 0.0  # Will be updated when send_task completes
 
-                    # Server sends JSON messages
-                    data = json.loads(msg)
+                    def handle_token(text: str):
+                        """Process a received token and update state."""
+                        tokens.append(text)
+                        token_times.append(last_msg_ts - start_time)
+                        # Update state directly (avoid closure issues)
+                        state["recognized_text"] = "".join(tokens)
+                        state["tokens"] = len(tokens)
+                        state["bear_idx"] = len(tokens)
+                        if len(token_times) == 1:
+                            state["first_token"] = token_times[0]
+                            state["first_token_text"] = text
+                        if live:
+                            live.update(render())
 
-                    msg_type = data.get("type")
-                    if msg_type == "token":
-                        handle_token(data.get("text", ""))
-                    elif msg_type == "vad_end":
-                        state["vad_end"] = True
-                    elif msg_type == "ping":
-                        pass  # Server keepalive
-                    elif "text" in data:  # Legacy format
-                        handle_token(data.get("text", ""))
-                    elif data.get("status") == "complete":
-                        break
-            except asyncio.TimeoutError:
-                pass  # Expected for streaming
-            except websockets.exceptions.ConnectionClosed:
-                pass  # Session ended normally
+                    try:
+                        while True:
+                            if stop_event and stop_event.is_set():
+                                break
+                            # Stop after inactivity once audio is fully sent
+                            timeout = 2.0
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                            except asyncio.TimeoutError:
+                                if send_task.done() and (time.perf_counter() - last_msg_ts) > 5.0:
+                                    break
+                                if stop_event and stop_event.is_set():
+                                    break
+                                continue
 
-            if stop_event and stop_event.is_set() and not send_task.done():
-                send_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                send_time = await send_task
-            total_time = time.perf_counter() - start_time
-            full_text = "".join(tokens)
-            state["send_time"] = send_time
-            state["total_time"] = total_time
-            state["status"] = "complete"
-            if live:
-                live.update(render())
+                            last_msg_ts = time.perf_counter()
+
+                            # Server sends JSON messages
+                            data = json.loads(msg)
+
+                            msg_type = data.get("type")
+                            if msg_type == "token":
+                                handle_token(data.get("text", ""))
+                            elif msg_type == "vad_end":
+                                state["vad_end"] = True
+                            elif msg_type == "ping":
+                                pass  # Server keepalive
+                            elif "text" in data:  # Legacy format
+                                handle_token(data.get("text", ""))
+                            elif data.get("status") == "complete":
+                                break
+                    except asyncio.TimeoutError:
+                        pass  # Expected for streaming
+                    except websockets.exceptions.ConnectionClosed:
+                        pass  # Session ended normally
+
+                    if stop_event and stop_event.is_set() and not send_task.done():
+                        send_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        send_time = await send_task
+                    total_time = time.perf_counter() - start_time
+                    full_text = "".join(tokens)
+                    state["send_time"] = send_time
+                    state["total_time"] = total_time
+                    state["status"] = "complete"
+                    if live:
+                        live.update(render())
+                    break
+            except websockets.exceptions.InvalidStatus as e:
+                # Modal may return HTTP 200/503 while container is warming; retry a few times
+                if attempt >= max_connect_attempts or (stop_event and stop_event.is_set()):
+                    raise
+                state["status"] = f"connecting (retry {attempt}/{max_connect_attempts})"
+                if live:
+                    live.update(render())
+                await asyncio.sleep(connect_retry_delay)
+                continue
+            except OSError as e:
+                # Connection refused/host down; retry for cold start
+                if attempt >= max_connect_attempts or (stop_event and stop_event.is_set()):
+                    raise
+                state["status"] = f"connecting (retry {attempt}/{max_connect_attempts})"
+                if live:
+                    live.update(render())
+                await asyncio.sleep(connect_retry_delay)
+                continue
     except Exception as e:
         # Connection failed - update state and re-raise
         state["status"] = f"error: {e}"
@@ -659,15 +684,17 @@ async def run_parallel_test(
     playback: bool = False,
     playback_device: int | None = None,
     no_tui: bool = False,
+    quiet: bool = False,
 ):
     """Run multiple streams in parallel to test concurrent handling."""
 
     # Fall back to quiet mode if TUI not available or disabled
-    use_tui = RICH_AVAILABLE and not no_tui
+    use_tui = RICH_AVAILABLE and not no_tui and not quiet
 
     if not use_tui:
         # Simple parallel test without TUI
-        print(f"Running {num_streams} parallel streams...")
+        if not quiet:
+            print(f"Running {num_streams} parallel streams...")
 
         async def labeled_test_quiet(idx: int):
             result = await measure_latency(
@@ -789,42 +816,46 @@ async def run_parallel_test(
             live.stop()
 
     # Print summary (same for both TUI and non-TUI modes)
-    print(f"\n{'='*50}")
-    print("Parallel Test Summary")
-    print('='*50)
+    if not quiet:
+        print(f"\n{'='*50}")
+        print("Parallel Test Summary")
+        print('='*50)
 
     successful = []
     recognized_text = None
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"  Stream {i+1}: FAILED - {type(result).__name__}: {result}")
+            if not quiet:
+                print(f"  Stream {i+1}: FAILED - {type(result).__name__}: {result}")
         else:
             idx, metrics = result
             if metrics.get("first_token_time"):
                 successful.append(metrics["first_token_time"])
                 last = metrics.get("last_token_time")
-                print(
-                    f"  Stream {i+1}: "
-                    f"first={metrics['first_token_time']:.3f}s, "
-                    f"last={(last if last is not None else float('nan')):.3f}s, "
-                    f"tokens={metrics['token_count']}"
-                )
+                if not quiet:
+                    print(
+                        f"  Stream {i+1}: "
+                        f"first={metrics['first_token_time']:.3f}s, "
+                        f"last={(last if last is not None else float('nan')):.3f}s, "
+                        f"tokens={metrics['token_count']}"
+                    )
                 # Capture recognized text from first successful result
                 if recognized_text is None:
                     recognized_text = metrics.get("recognized_text", "")
             else:
-                # Show diagnostic info
-                connect = metrics.get("connect_time")
-                send = metrics.get("send_time")
-                total = metrics.get("total_time")
-                print(f"  Stream {i+1}: No tokens received (connect={connect:.2f}s, send={send:.2f}s, total={total:.2f}s)" if connect else f"  Stream {i+1}: No tokens received (no metrics)")
+                if not quiet:
+                    # Show diagnostic info
+                    connect = metrics.get("connect_time")
+                    send = metrics.get("send_time")
+                    total = metrics.get("total_time")
+                    print(f"  Stream {i+1}: No tokens received (connect={connect:.2f}s, send={send:.2f}s, total={total:.2f}s)" if connect else f"  Stream {i+1}: No tokens received (no metrics)")
 
-    if successful:
+    if not quiet and successful:
         print(f"\n  Avg first token: {sum(successful)/len(successful):.3f}s")
         print(f"  Min first token: {min(successful):.3f}s")
         print(f"  Max first token: {max(successful):.3f}s")
 
-    if recognized_text:
+    if not quiet and recognized_text:
         print(f"\n  Transcription: {recognized_text.strip()}")
 
     return successful
@@ -897,24 +928,30 @@ async def compare_gpus(
     async def warmup_one(gpu: str, uri: str):
         print(f"  Warming up {gpu}...")
         try:
-            await measure_latency(
+            result = await measure_latency(
                 uri,
                 wav_path=wav_path,
                 auth_headers=auth_headers,
                 real_time_factor=real_time_factor,
                 expected_text=expected_text,
                 stop_event=stop_event,
-                playback=playback,
-                playback_device=playback_device,
+                playback=False,
+                playback_device=None,
+                quiet=True,
             )
-            print(f"  {gpu} warm")
-            return True
+            ft = result.get("first_token_time")
+            ft_str = f"{ft:.3f}s" if ft else "n/a"
+            print(f"  {gpu} warm (first token {ft_str})")
+            return True, result
         except Exception as e:
             print(f"  {gpu} warmup failed: {e}")
-            return False
+            return False, {"error": str(e)}
 
     warmup_tasks = [warmup_one(gpu, url) for gpu, url in gpu_urls.items()]
-    await asyncio.gather(*warmup_tasks)
+    warmup_results = await asyncio.gather(*warmup_tasks)
+    for (gpu, _), (ok, payload) in zip(gpu_urls.items(), warmup_results):
+        if not ok:
+            print(f"Warmup for {gpu} failed: {payload.get('error')}")
 
     # Step 3: Test each GPU variant
     print(f"\n{'='*60}")
@@ -922,8 +959,9 @@ async def compare_gpus(
     print('='*60)
 
     results = {}
-    for gpu, uri in gpu_urls.items():
-        print(f"\n--- {gpu} ---")
+
+    async def run_test_for_gpu(gpu: str, uri: str):
+        """Run latency test for one GPU and return latencies."""
         latencies = await run_parallel_test(
             uri,
             num_streams,
@@ -934,7 +972,19 @@ async def compare_gpus(
             stop_event=stop_event,
             playback=playback,
             playback_device=playback_device,
+            no_tui=True,  # avoid interleaved TUIs when running concurrently
+            quiet=True,
         )
+        return gpu, latencies, None
+
+    test_tasks = [run_test_for_gpu(gpu, uri) for gpu, uri in gpu_urls.items()]
+    test_results = await asyncio.gather(*test_tasks, return_exceptions=True)
+
+    for result in test_results:
+        if isinstance(result, Exception):
+            print(f"\n--- GPU test failed: {result}")
+            continue
+        gpu, latencies, _ = result
         if latencies:
             results[gpu] = {
                 "avg": sum(latencies) / len(latencies),
@@ -942,6 +992,15 @@ async def compare_gpus(
                 "max": max(latencies),
                 "samples": latencies,
             }
+            print(f"\n--- {gpu} ---")
+            print(
+                f"first_token avg={results[gpu]['avg']:.3f}s "
+                f"min={results[gpu]['min']:.3f}s max={results[gpu]['max']:.3f}s "
+                f"samples={len(latencies)}"
+            )
+        else:
+            print(f"\n--- {gpu} ---")
+            print("No latency samples collected.")
 
     # Print comparison
     print(f"\n{'='*60}")
