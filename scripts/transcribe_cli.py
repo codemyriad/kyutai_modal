@@ -2,8 +2,8 @@
 """
 Real-time Microphone Transcription CLI
 
-Captures audio from your microphone and streams it to the Modal-deployed
-Kyutai STT service for real-time transcription with live-updating display.
+Captures audio from your microphone and streams it to a Kyutai STT service
+(Modal or local) for real-time transcription with live-updating display.
 
 Features:
 - Real-time microphone capture at 24kHz
@@ -17,6 +17,7 @@ Usage:
 Environment variables:
     MODAL_KEY     - Modal proxy auth key
     MODAL_SECRET  - Modal proxy auth secret
+    LOCAL_WS_URL  - Local WebSocket URL (used with --service local)
 """
 
 import argparse
